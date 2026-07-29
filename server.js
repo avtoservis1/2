@@ -22,6 +22,7 @@
 
 const path = require('path');
 const express = require('express');
+const cors = require('cors');
 const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 require('dotenv').config();
@@ -38,10 +39,12 @@ const {
   NOTIFY_EMAIL_TO,
   RECAPTCHA_SECRET_KEY,
   DATABASE_URL = 'postgresql://postgres:LNCBjskDZtgwoRMOxSHiNYHMuIemTVwQ@sakura.proxy.rlwy.net:28926/railway',
+  ALLOWED_ORIGIN = '*', // set to your Netlify URL in production, e.g. https://asliddinx212.netlify.app
   PORT = 3000,
 } = process.env;
 
 const app = express();
+app.use(cors({ origin: ALLOWED_ORIGIN === '*' ? true : ALLOWED_ORIGIN.split(',').map((s) => s.trim()) }));
 app.use(express.json({ limit: '1mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
