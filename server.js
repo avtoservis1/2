@@ -10,9 +10,13 @@
  *   1) ANTHROPIC_API_KEY        — Claude API key (console.anthropic.com)
  *   2) TELEGRAM_BOT_TOKEN       — Telegram bot token (from @BotFather)
  *   3) TELEGRAM_CHAT_ID         — chat/group/channel id that should receive RFQs
- *   4) SMTP_HOST / SMTP_PORT / SMTP_USER / SMTP_PASS  — company mailbox SMTP creds
- *   5) NOTIFY_EMAIL_TO          — where RFQ emails should be delivered
- *   6) (optional) RECAPTCHA_SECRET_KEY — if you turn reCAPTCHA v3 verification on
+ *   4) RESEND_API_KEY           — Resend API key (resend.com) — used to send emails over HTTPS
+ *                                 (works even on hosts like Railway that block outbound SMTP)
+ *   5) RESEND_FROM              — sender address. In TEST MODE (no verified domain), use
+ *                                 "onboarding@resend.dev" — Resend will then only deliver to
+ *                                 the email address you signed up to Resend with.
+ *   6) NOTIFY_EMAIL_TO          — where RFQ emails should be delivered
+ *   7) (optional) RECAPTCHA_SECRET_KEY — if you turn reCAPTCHA v3 verification on
  *
  * Run:
  *   npm install
@@ -23,7 +27,6 @@
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const nodemailer = require('nodemailer');
 const { Pool } = require('pg');
 require('dotenv').config();
 
@@ -32,10 +35,8 @@ const {
   ANTHROPIC_MODEL = 'claude-sonnet-4-20250514',
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
-  SMTP_HOST,
-  SMTP_PORT,
-  SMTP_USER,
-  SMTP_PASS,
+  RESEND_API_KEY,
+  RESEND_FROM = 'onboarding@resend.dev', // test mode default — swap once your domain is verified
   NOTIFY_EMAIL_TO,
   RECAPTCHA_SECRET_KEY,
   DATABASE_URL = 'postgresql://postgres:LNCBjskDZtgwoRMOxSHiNYHMuIemTVwQ@sakura.proxy.rlwy.net:28926/railway',
@@ -149,29 +150,35 @@ async function sendTelegramMessage(text) {
 }
 
 // -------------------------------------------------------------------------
-// Email notification (SMTP via nodemailer)
+// Email notification (Resend HTTPS API — works even where outbound SMTP
+// ports are blocked, e.g. Railway's Free/Trial/Hobby plans).
+// TEST MODE: with RESEND_FROM=onboarding@resend.dev (no verified domain),
+// Resend will only actually deliver to the email address you signed up
+// with on Resend. Verify your own domain later to email anyone.
 // -------------------------------------------------------------------------
-let mailer = null;
-if (SMTP_HOST && SMTP_USER && SMTP_PASS) {
-  mailer = nodemailer.createTransport({
-    host: SMTP_HOST,
-    port: Number(SMTP_PORT) || 587,
-    secure: Number(SMTP_PORT) === 465,
-    auth: { user: SMTP_USER, pass: SMTP_PASS },
-  });
-} else {
-  console.warn('[email] SMTP_HOST / SMTP_USER / SMTP_PASS not set — skipping Email notification');
+if (!RESEND_API_KEY) {
+  console.warn('[email] RESEND_API_KEY not set — skipping Email notification');
 }
 
 async function sendEmailNotification(subject, html) {
-  if (!mailer || !NOTIFY_EMAIL_TO) return;
+  if (!RESEND_API_KEY || !NOTIFY_EMAIL_TO) return;
   try {
-    await mailer.sendMail({
-      from: `"Special Cargo Services — Website" <${SMTP_USER}>`,
-      to: NOTIFY_EMAIL_TO,
-      subject,
-      html,
+    const res = await fetch('https://api.resend.com/emails', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${RESEND_API_KEY}`,
+      },
+      body: JSON.stringify({
+        from: `Special Cargo Services — Website <${RESEND_FROM}>`,
+        to: NOTIFY_EMAIL_TO.split(',').map((s) => s.trim()),
+        subject,
+        html,
+      }),
     });
+    if (!res.ok) {
+      console.error('[email] failed:', res.status, await res.text());
+    }
   } catch (err) {
     console.error('[email] error:', err);
   }
