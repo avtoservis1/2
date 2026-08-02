@@ -32,7 +32,7 @@ require('dotenv').config();
 
 const {
   ANTHROPIC_API_KEY,
-  ANTHROPIC_MODEL = 'claude-sonnet-4-20250514',
+  ANTHROPIC_MODEL = 'claude-sonnet-4-5',
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   RESEND_API_KEY,
@@ -185,6 +185,76 @@ async function sendEmailNotification(subject, html) {
 }
 
 // -------------------------------------------------------------------------
+// Pretty HTML email builder for RFQ notifications
+// -------------------------------------------------------------------------
+function escapeHtml(str) {
+  return String(str ?? '').replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+const URGENCY_LABELS = {
+  express: { label: '🔴 Express (shoshilinch)', color: '#dc2626' },
+  standard: { label: '🟡 Standard', color: '#d97706' },
+  economy: { label: '🟢 Economy (shoshilmas)', color: '#16a34a' },
+};
+
+function buildRfqEmailHtml(rfq) {
+  const urgencyInfo = URGENCY_LABELS[String(rfq.urgency).toLowerCase()] || {
+    label: rfq.urgency || '—',
+    color: '#64748b',
+  };
+
+  const row = (label, value) =>
+    value
+      ? `<tr>
+           <td style="padding:10px 16px;color:#64748b;font-size:13px;font-weight:600;white-space:nowrap;vertical-align:top;">${escapeHtml(label)}</td>
+           <td style="padding:10px 16px;color:#0f172a;font-size:14px;">${escapeHtml(value)}</td>
+         </tr>`
+      : '';
+
+  return `
+  <div style="background:#f1f5f9;padding:32px 16px;font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
+    <div style="max-width:600px;margin:0 auto;background:#ffffff;border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,0.08);">
+
+      <div style="background:#0f172a;padding:24px 28px;">
+        <p style="margin:0;color:#94a3b8;font-size:12px;letter-spacing:0.05em;text-transform:uppercase;">Special Cargo Services</p>
+        <h1 style="margin:6px 0 0;color:#ffffff;font-size:20px;">🆕 Yangi tarif so'rovi (RFQ)</h1>
+        <p style="margin:6px 0 0;color:#cbd5e1;font-size:13px;">${escapeHtml(rfq.id)} · ${new Date(rfq.receivedAt || Date.now()).toLocaleString('uz-UZ')}</p>
+      </div>
+
+      <div style="padding:8px 12px;">
+        <div style="display:inline-block;margin:16px 16px 0;padding:6px 14px;border-radius:999px;background:${urgencyInfo.color}1a;color:${urgencyInfo.color};font-size:13px;font-weight:700;">
+          ${urgencyInfo.label}
+        </div>
+
+        <table style="width:100%;border-collapse:collapse;margin-top:8px;">
+          ${row('👤 Mijoz', rfq.fullName)}
+          ${row('🏢 Kompaniya', rfq.company)}
+          ${row('📞 Telefon', rfq.phone)}
+          ${row('✉️ Email', rfq.email)}
+          ${row('📍 Qayerdan', rfq.origin)}
+          ${row('📍 Qayerga', rfq.destination)}
+          ${row('📦 Yuk turi', rfq.cargoType)}
+          ${row('⚖️ Og\'irligi', rfq.weight ? `${rfq.weight} kg` : '')}
+          ${row('🔢 Dona soni', rfq.pieces)}
+          ${row('📐 O\'lchamlari', rfq.dimensions)}
+          ${row('📄 Incoterms', rfq.incoterms)}
+          ${row('📅 Tayyor sana', rfq.cargoReadyDate)}
+          ${row('⚠️ Maxsus talablar', rfq.specialRequirements)}
+          ${row('📝 Tavsif', rfq.cargoDescription || rfq.summary)}
+          ${row('📥 Manba', rfq.source === 'ai_assistant' ? 'AI Cargo Assistant' : 'Sayt formasi')}
+        </table>
+      </div>
+
+      <div style="padding:16px 28px;background:#f8fafc;border-top:1px solid #e2e8f0;">
+        <p style="margin:0;color:#94a3b8;font-size:12px;">Bu xabar specialcargo.uz saytidan avtomatik yuborildi.</p>
+      </div>
+    </div>
+  </div>`;
+}
+
+// -------------------------------------------------------------------------
 // (Optional) reCAPTCHA v3 verification — call from /api/rfq if you enable it
 // and add a `recaptchaToken` field on the frontend form.
 // -------------------------------------------------------------------------
@@ -258,8 +328,8 @@ app.post('/api/rfq', async (req, res) => {
     await Promise.all([
       sendTelegramMessage(summaryText),
       sendEmailNotification(
-        `New RFQ — ${rfq.fullName} (${rfq.id})`,
-        `<pre style="font-family:monospace">${JSON.stringify(rfq, null, 2)}</pre>`
+        `Yangi so'rov — ${rfq.fullName} (${rfq.id})`,
+        buildRfqEmailHtml(rfq)
       ),
     ]);
 
@@ -378,7 +448,7 @@ app.post('/api/chat', async (req, res) => {
       // fire and forget — don't block the chat reply on notification delivery
       Promise.all([
         sendTelegramMessage(summaryText),
-        sendEmailNotification(`New RFQ from AI Assistant — ${rfqRecord.id}`, `<pre>${JSON.stringify(rfqRecord, null, 2)}</pre>`),
+        sendEmailNotification(`Yangi so'rov — AI Assistant (${rfqRecord.id})`, buildRfqEmailHtml(rfqRecord)),
       ]).catch((err) => console.error('[chat] notification error:', err));
     }
 
