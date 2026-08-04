@@ -27,8 +27,26 @@
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
+const multer = require('multer');
 const { Pool } = require('pg');
 require('dotenv').config();
+
+// -------------------------------------------------------------------------
+// File attachments (AI Cargo Assistant) — clients can attach a packing
+// list, invoice, MSDS / safety data sheet, or other shipment document.
+// Kept in memory only (never written to disk) and sent straight to the
+// Claude API + Telegram; nothing is persisted beyond the request.
+// -------------------------------------------------------------------------
+const ALLOWED_ATTACHMENT_MIME_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_ATTACHMENT_BYTES },
+  fileFilter: (req, file, cb) => {
+    if (ALLOWED_ATTACHMENT_MIME_TYPES.includes(file.mimetype)) return cb(null, true);
+    cb(new Error('unsupported_file_type'));
+  },
+});
 
 const {
   ANTHROPIC_API_KEY,
@@ -146,6 +164,28 @@ async function sendTelegramMessage(text) {
     }
   } catch (err) {
     console.error('[telegram] error:', err);
+  }
+}
+
+// -------------------------------------------------------------------------
+// Telegram: forward a client-attached document (packing list, invoice,
+// MSDS, etc.) to the ops chat as-is, so managers have the original file.
+// -------------------------------------------------------------------------
+async function sendTelegramDocument(buffer, filename, mimetype, caption) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    const url = `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendDocument`;
+    const form = new FormData();
+    form.append('chat_id', TELEGRAM_CHAT_ID);
+    form.append('caption', caption || '');
+    form.append('parse_mode', 'HTML');
+    form.append('document', new Blob([buffer], { type: mimetype }), filename);
+    const res = await fetch(url, { method: 'POST', body: form });
+    if (!res.ok) {
+      console.error('[telegram] sendDocument failed:', res.status, await res.text());
+    }
+  } catch (err) {
+    console.error('[telegram] sendDocument error:', err);
   }
 }
 
@@ -360,6 +400,13 @@ Your job in this chat:
 4. Reply in the SAME language the user is writing in. Support Russian and English fluently (and
    do your best in Uzbek or Chinese if the user writes in those).
 5. Keep answers short, professional, friendly — this is a chat widget, not an essay.
+5a. The client may attach a document (packing list, commercial invoice, MSDS / safety data sheet,
+   or another shipment document) as a PDF or image. When a document is attached, read it carefully
+   and automatically extract whatever is relevant: origin/destination, cargo type (including
+   dangerous goods class if it's an MSDS), weight, dimensions, number of pieces, and any special
+   handling requirements. Confirm back to the user in 1-2 lines what you extracted from the
+   document, then ask ONLY for whatever required details are still missing — do not re-ask for
+   anything already visible in the document.
 6. Once you have gathered enough details to file a request (route + cargo type + weight/pieces),
    summarize it back to the user in 1-2 lines and tell them a manager will follow up within 2-4
    hours, and that the request has been forwarded to the team and Telegram.
@@ -383,22 +430,64 @@ function extractRfqTag(text) {
   return { cleanText, rfq };
 }
 
-app.post('/api/chat', async (req, res) => {
+app.post('/api/chat', (req, res, next) => {
+  upload.single('file')(req, res, (err) => {
+    if (err) {
+      const code = err.message === 'unsupported_file_type' ? 'unsupported_file_type' : 'file_too_large';
+      return res.status(400).json({ error: code });
+    }
+    next();
+  });
+}, async (req, res) => {
   try {
     if (!ANTHROPIC_API_KEY) {
       return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
     }
 
-    const { messages = [] } = req.body || {};
+    // Frontend sends FormData: `messages` is a JSON string, `lang` a plain
+    // string, and `file` (optional) the attached document/image.
+    let messages = [];
+    try {
+      const raw = req.body && req.body.messages;
+      messages = raw ? JSON.parse(raw) : [];
+    } catch (err) {
+      return res.status(400).json({ error: 'invalid_messages' });
+    }
     if (!Array.isArray(messages) || messages.length === 0) {
       return res.status(400).json({ error: 'messages is required' });
     }
+    const lang = (req.body && req.body.lang) || 'ru';
 
     // Only forward role/content pairs Claude expects.
     const claudeMessages = messages
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
       .map((m) => ({ role: m.role, content: String(m.content).slice(0, 4000) }))
       .slice(-20); // keep last 20 turns max
+
+    // If a document was attached, attach it (as base64) to the LAST message
+    // only (the one that came in with it), so Claude can read it directly.
+    const file = req.file;
+    if (file && claudeMessages.length > 0) {
+      const lastIdx = claudeMessages.length - 1;
+      const last = claudeMessages[lastIdx];
+      const base64Data = file.buffer.toString('base64');
+      const block = file.mimetype === 'application/pdf'
+        ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Data } }
+        : { type: 'image', source: { type: 'base64', media_type: file.mimetype, data: base64Data } };
+      claudeMessages[lastIdx] = {
+        role: last.role,
+        content: [{ type: 'text', text: last.content }, block],
+      };
+
+      // Forward the original document to Telegram right away so a human
+      // has it too, independent of whether the AI later files a full RFQ.
+      sendTelegramDocument(
+        file.buffer,
+        file.originalname || 'attachment',
+        file.mimetype,
+        '📎 <b>Mijoz AI Assistant orqali hujjat yubordi</b>'
+      ).catch((err) => console.error('[chat] telegram document forward error:', err));
+    }
 
     const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
       method: 'POST',
