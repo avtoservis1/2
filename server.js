@@ -3,11 +3,11 @@
  * ------------------------------------------------
  * Serves the website (static files in /public) and exposes two API routes:
  *
- *   POST /api/chat   → AI Cargo Assistant (real OpenAI API integration)
+ *   POST /api/chat   → AI Cargo Assistant (real Google Gemini API integration)
  *   POST /api/rfq    → RFQ form submission (saves it + notifies Telegram & Email)
  *
  * WHAT YOU NEED TO FILL IN (see the ".env" section below / .env.example):
- *   1) OPENAI_API_KEY           — OpenAI API key (platform.openai.com)
+ *   1) GEMINI_API_KEY           — Google Gemini API key (aistudio.google.com/apikey)
  *   2) TELEGRAM_BOT_TOKEN       — Telegram bot token (from @BotFather)
  *   3) TELEGRAM_CHAT_ID         — chat/group/channel id that should receive RFQs
  *   4) RESEND_API_KEY           — Resend API key (resend.com) — used to send emails over HTTPS
@@ -35,7 +35,7 @@ require('dotenv').config();
 // File attachments (AI Cargo Assistant) — clients can attach a packing
 // list, invoice, MSDS / safety data sheet, or other shipment document.
 // Kept in memory only (never written to disk) and sent straight to the
-// OpenAI API + Telegram; nothing is persisted beyond the request.
+// Gemini API + Telegram; nothing is persisted beyond the request.
 // -------------------------------------------------------------------------
 const ALLOWED_ATTACHMENT_MIME_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -49,8 +49,8 @@ const upload = multer({
 });
 
 const {
-  OPENAI_API_KEY,
-  OPENAI_MODEL = 'gpt-4o',
+  GEMINI_API_KEY,
+  GEMINI_MODEL = 'gemini-2.0-flash',
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   RESEND_API_KEY,
@@ -381,7 +381,7 @@ app.post('/api/rfq', async (req, res) => {
 });
 
 // =========================================================================
-// POST /api/chat — AI Cargo Assistant (OpenAI API)
+// POST /api/chat — AI Cargo Assistant (Google Gemini API)
 // =========================================================================
 const SYSTEM_PROMPT = `You are the "AI Cargo Assistant" for SPECIAL CARGO SERVICES (SCS), an
 international air cargo & transit logistics company based in Tashkent, Uzbekistan (est. 2017).
@@ -440,8 +440,8 @@ app.post('/api/chat', (req, res, next) => {
   });
 }, async (req, res) => {
   try {
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: 'OPENAI_API_KEY is not configured on the server' });
+    if (!GEMINI_API_KEY) {
+      return res.status(500).json({ error: 'GEMINI_API_KEY is not configured on the server' });
     }
 
     // Frontend sends FormData: `messages` is a JSON string, `lang` a plain
@@ -458,28 +458,26 @@ app.post('/api/chat', (req, res, next) => {
     }
     const lang = (req.body && req.body.lang) || 'ru';
 
-    // Only forward role/content pairs the OpenAI Responses API expects.
-    // Each turn's content is an array of "input_text" parts (Responses API
-    // format), which also lets us mix in image/file parts below.
-    const openaiInput = messages
+    // Gemini's `contents` format uses role "user" / "model" (not
+    // "assistant"), and each turn is an array of "parts".
+    const geminiContents = messages
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
       .map((m) => ({
-        role: m.role,
-        content: [{ type: m.role === 'user' ? 'input_text' : 'output_text', text: String(m.content).slice(0, 4000) }],
+        role: m.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: String(m.content).slice(0, 4000) }],
       }))
       .slice(-20); // keep last 20 turns max
 
-    // If a document was attached, attach it (as base64) to the LAST message
-    // only (the one that came in with it), so the model can read it directly.
+    // If a document was attached, attach it (as inline base64 data) to the
+    // LAST turn only (the one that came in with it), so Gemini reads it
+    // directly — Gemini supports images and PDFs as inline_data natively.
     const file = req.file;
-    if (file && openaiInput.length > 0) {
-      const lastIdx = openaiInput.length - 1;
+    if (file && geminiContents.length > 0) {
+      const lastIdx = geminiContents.length - 1;
       const base64Data = file.buffer.toString('base64');
-      const dataUrl = `data:${file.mimetype};base64,${base64Data}`;
-      const block = file.mimetype === 'application/pdf'
-        ? { type: 'input_file', filename: file.originalname || 'document.pdf', file_data: dataUrl }
-        : { type: 'input_image', image_url: dataUrl };
-      openaiInput[lastIdx].content.push(block);
+      geminiContents[lastIdx].parts.push({
+        inline_data: { mime_type: file.mimetype, data: base64Data },
+      });
 
       // Forward the original document to Telegram right away so a human
       // has it too, independent of whether the AI later files a full RFQ.
@@ -491,31 +489,31 @@ app.post('/api/chat', (req, res, next) => {
       ).catch((err) => console.error('[chat] telegram document forward error:', err));
     }
 
-    const apiRes = await fetch('https://api.openai.com/v1/responses', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: OPENAI_MODEL,
-        instructions: SYSTEM_PROMPT,
-        input: openaiInput,
-        max_output_tokens: 600,
-      }),
-    });
+    const apiRes = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': GEMINI_API_KEY,
+        },
+        body: JSON.stringify({
+          system_instruction: { parts: [{ text: SYSTEM_PROMPT }] },
+          contents: geminiContents,
+          generationConfig: { maxOutputTokens: 600 },
+        }),
+      }
+    );
 
     if (!apiRes.ok) {
       const errText = await apiRes.text();
-      console.error('[chat] OpenAI API error:', apiRes.status, errText);
+      console.error('[chat] Gemini API error:', apiRes.status, errText);
       return res.status(502).json({ error: 'ai_provider_error' });
     }
 
     const data = await apiRes.json();
-    const rawText = (data.output || [])
-      .filter((item) => item.type === 'message')
-      .flatMap((item) => item.content || [])
-      .filter((part) => part.type === 'output_text')
+    const rawText = ((data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts) || [])
+      .filter((part) => typeof part.text === 'string')
       .map((part) => part.text)
       .join('\n');
 
