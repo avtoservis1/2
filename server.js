@@ -3,11 +3,11 @@
  * ------------------------------------------------
  * Serves the website (static files in /public) and exposes two API routes:
  *
- *   POST /api/chat   → AI Cargo Assistant (real Claude API integration)
+ *   POST /api/chat   → AI Cargo Assistant (real OpenAI API integration)
  *   POST /api/rfq    → RFQ form submission (saves it + notifies Telegram & Email)
  *
  * WHAT YOU NEED TO FILL IN (see the ".env" section below / .env.example):
- *   1) ANTHROPIC_API_KEY        — Claude API key (console.anthropic.com)
+ *   1) OPENAI_API_KEY           — OpenAI API key (platform.openai.com)
  *   2) TELEGRAM_BOT_TOKEN       — Telegram bot token (from @BotFather)
  *   3) TELEGRAM_CHAT_ID         — chat/group/channel id that should receive RFQs
  *   4) RESEND_API_KEY           — Resend API key (resend.com) — used to send emails over HTTPS
@@ -35,7 +35,7 @@ require('dotenv').config();
 // File attachments (AI Cargo Assistant) — clients can attach a packing
 // list, invoice, MSDS / safety data sheet, or other shipment document.
 // Kept in memory only (never written to disk) and sent straight to the
-// Claude API + Telegram; nothing is persisted beyond the request.
+// OpenAI API + Telegram; nothing is persisted beyond the request.
 // -------------------------------------------------------------------------
 const ALLOWED_ATTACHMENT_MIME_TYPES = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024; // 10 MB
@@ -49,8 +49,8 @@ const upload = multer({
 });
 
 const {
-  ANTHROPIC_API_KEY,
-  ANTHROPIC_MODEL = 'claude-sonnet-4-5',
+  OPENAI_API_KEY,
+  OPENAI_MODEL = 'gpt-4o',
   TELEGRAM_BOT_TOKEN,
   TELEGRAM_CHAT_ID,
   RESEND_API_KEY,
@@ -381,7 +381,7 @@ app.post('/api/rfq', async (req, res) => {
 });
 
 // =========================================================================
-// POST /api/chat — AI Cargo Assistant (Claude API)
+// POST /api/chat — AI Cargo Assistant (OpenAI API)
 // =========================================================================
 const SYSTEM_PROMPT = `You are the "AI Cargo Assistant" for SPECIAL CARGO SERVICES (SCS), an
 international air cargo & transit logistics company based in Tashkent, Uzbekistan (est. 2017).
@@ -440,8 +440,8 @@ app.post('/api/chat', (req, res, next) => {
   });
 }, async (req, res) => {
   try {
-    if (!ANTHROPIC_API_KEY) {
-      return res.status(500).json({ error: 'ANTHROPIC_API_KEY is not configured on the server' });
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({ error: 'OPENAI_API_KEY is not configured on the server' });
     }
 
     // Frontend sends FormData: `messages` is a JSON string, `lang` a plain
@@ -458,26 +458,28 @@ app.post('/api/chat', (req, res, next) => {
     }
     const lang = (req.body && req.body.lang) || 'ru';
 
-    // Only forward role/content pairs Claude expects.
-    const claudeMessages = messages
+    // Only forward role/content pairs the OpenAI Responses API expects.
+    // Each turn's content is an array of "input_text" parts (Responses API
+    // format), which also lets us mix in image/file parts below.
+    const openaiInput = messages
       .filter((m) => m && (m.role === 'user' || m.role === 'assistant') && m.content)
-      .map((m) => ({ role: m.role, content: String(m.content).slice(0, 4000) }))
+      .map((m) => ({
+        role: m.role,
+        content: [{ type: m.role === 'user' ? 'input_text' : 'output_text', text: String(m.content).slice(0, 4000) }],
+      }))
       .slice(-20); // keep last 20 turns max
 
     // If a document was attached, attach it (as base64) to the LAST message
-    // only (the one that came in with it), so Claude can read it directly.
+    // only (the one that came in with it), so the model can read it directly.
     const file = req.file;
-    if (file && claudeMessages.length > 0) {
-      const lastIdx = claudeMessages.length - 1;
-      const last = claudeMessages[lastIdx];
+    if (file && openaiInput.length > 0) {
+      const lastIdx = openaiInput.length - 1;
       const base64Data = file.buffer.toString('base64');
+      const dataUrl = `data:${file.mimetype};base64,${base64Data}`;
       const block = file.mimetype === 'application/pdf'
-        ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: base64Data } }
-        : { type: 'image', source: { type: 'base64', media_type: file.mimetype, data: base64Data } };
-      claudeMessages[lastIdx] = {
-        role: last.role,
-        content: [{ type: 'text', text: last.content }, block],
-      };
+        ? { type: 'input_file', filename: file.originalname || 'document.pdf', file_data: dataUrl }
+        : { type: 'input_image', image_url: dataUrl };
+      openaiInput[lastIdx].content.push(block);
 
       // Forward the original document to Telegram right away so a human
       // has it too, independent of whether the AI later files a full RFQ.
@@ -489,31 +491,32 @@ app.post('/api/chat', (req, res, next) => {
       ).catch((err) => console.error('[chat] telegram document forward error:', err));
     }
 
-    const apiRes = await fetch('https://api.anthropic.com/v1/messages', {
+    const apiRes = await fetch('https://api.openai.com/v1/responses', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        Authorization: `Bearer ${OPENAI_API_KEY}`,
       },
       body: JSON.stringify({
-        model: ANTHROPIC_MODEL,
-        max_tokens: 500,
-        system: SYSTEM_PROMPT,
-        messages: claudeMessages,
+        model: OPENAI_MODEL,
+        instructions: SYSTEM_PROMPT,
+        input: openaiInput,
+        max_output_tokens: 600,
       }),
     });
 
     if (!apiRes.ok) {
       const errText = await apiRes.text();
-      console.error('[chat] Anthropic API error:', apiRes.status, errText);
+      console.error('[chat] OpenAI API error:', apiRes.status, errText);
       return res.status(502).json({ error: 'ai_provider_error' });
     }
 
     const data = await apiRes.json();
-    const rawText = (data.content || [])
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
+    const rawText = (data.output || [])
+      .filter((item) => item.type === 'message')
+      .flatMap((item) => item.content || [])
+      .filter((part) => part.type === 'output_text')
+      .map((part) => part.text)
       .join('\n');
 
     const { cleanText, rfq } = extractRfqTag(rawText);
