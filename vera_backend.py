@@ -689,9 +689,10 @@ async def speak(req: SpeakRequest):
         audio_bytes = await synthesize_speech(
             clean_text[:2000], req.rate_percent, req.pitch_percent
         )
-        # Gaplar orasidagi uzun pauzalarni qisqartirib, tabiiyroq,
-        # gaplari bir-biriga qo'shilib ketadigan qilib beramiz.
-        audio_bytes = tighten_pauses(audio_bytes)
+        # Eslatma: pauza qisqartirish (tighten_pauses) ataylab
+        # chaqirilmayapti — u audio bo'laklarini kesib-ulaganda sezilarli
+        # bo'lib qolgani uchun o'chirib qo'yildi. Endi asl, kesilmagan
+        # edge-tts audiosi to'g'ridan-to'g'ri qaytariladi.
     except Exception as e:
         print(f"[SPEAK ENDPOINT XATO] {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Ovoz xizmati xatosi: {e}")
