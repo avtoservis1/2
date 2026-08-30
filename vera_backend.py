@@ -591,3 +591,4 @@ if __name__ == "__main__":
     print("Ogohlantirish: maxfiy kalit tekshiruvi o'chirilgan — bu manzilni "
           "hech kimga bermang, aks holda har kim Vera bilan gaplasha oladi.")
     uvicorn.run(app, host=HOST, port=PORT)
+
