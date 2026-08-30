@@ -71,6 +71,12 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "BU_YERGA_CLAUDE_API_KEY
 # Ishlatiladigan model
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 
+# Agar API kalitingiz "identity-linked" (bir nechta workspace'da ishlaydigan)
+# turdagi bo'lsa, Claude API har bir so'rovda anthropic-workspace-id headerini
+# talab qiladi. Shu yerga workspace ID'ingizni yozing (yoki Railway'da
+# ANTHROPIC_WORKSPACE_ID muhit o'zgaruvchisi orqali bering).
+ANTHROPIC_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID", "wrkspc_01EE58rCLYsbcgK7mVUoRW38")
+
 # Ilova bilan backend o'rtasidagi maxfiy kalit (o'zingiz o'ylab toping)
 APP_SECRET = os.environ.get("ULTRON_SECRET", "ultron-maxfiy-kalit-almashtiring")
 
@@ -318,6 +324,8 @@ def call_claude(messages: List[dict]) -> str:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
+    if ANTHROPIC_WORKSPACE_ID:
+        headers["anthropic-workspace-id"] = ANTHROPIC_WORKSPACE_ID
 
     conversation = list(messages)
 
