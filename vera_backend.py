@@ -35,7 +35,6 @@ RAILWAY'GA JOYLASH:
      "Reference" qilasiz).
   4) Railway "Variables" bo'limida quyidagilarni qo'shing:
        ANTHROPIC_API_KEY = sizning Claude API kalitingiz
-       VERA_SECRET       = o'zingiz o'ylab topgan maxfiy kalit
        TELEGRAM_BOT_TOKEN (ixtiyoriy)
        TELEGRAM_ALLOWED_CHAT_ID (ixtiyoriy)
        VERA_VOICE (ixtiyoriy, standart: uz-UZ-MadinaNeural)
@@ -48,8 +47,11 @@ RAILWAY'GA JOYLASH:
      sozlamalariga "Backend manzili" sifatida kiritasiz.
 
 XAVFSIZLIK:
-  APP_SECRET — bu maxfiy kalit. Faqat shu kalitni bilgan ilova (sizning
-  telefon/kompyuter ilovangiz) buyruq bera oladi. Buni hech kimga bermang.
+  DIQQAT: bu versiyada maxfiy kalit tekshiruvi butunlay o'chirilgan —
+  backend manzilini bilgan har qanday odam (yoki bot) so'rov yubora oladi,
+  Claude API balansingizni sarflashi va xabarlaringizni o'qishi mumkin.
+  Bu shaxsiy sinov uchun qulay, lekin manzilni hech kimga tarqatmang.
+  Keyinroq xohlasangiz, maxfiy kalitni qaytadan qo'shish mumkin.
 """
 
 import os
@@ -58,11 +60,11 @@ import json
 import threading
 import time
 import datetime
-from typing import List, Optional
+from typing import List
 
 import requests
 import edge_tts  # pip install edge-tts — Microsoft Edge'ning bepul neural TTS'i
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
@@ -77,9 +79,6 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "BU_YERGA_CLAUDE_API_KEY
 
 # Ishlatiladigan model
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
-
-# Ilova bilan backend o'rtasidagi maxfiy kalit (o'zingiz o'ylab toping)
-APP_SECRET = os.environ.get("VERA_SECRET", "vera-maxfiy-kalit-almashtiring")
 
 # Telegram bot (ixtiyoriy). Bo'sh qoldirsangiz, Telegram ishlamaydi.
 # Bot yaratish: Telegram'da @BotFather ga yozing -> /newbot
@@ -542,26 +541,19 @@ class ChatRequest(BaseModel):
     message: str
 
 
-def check_secret(x_vera_secret: Optional[str]):
-    if x_vera_secret != APP_SECRET:
-        raise HTTPException(status_code=401, detail="Noto'g'ri maxfiy kalit")
-
-
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.datetime.now().isoformat()}
 
 
 @app.post("/chat")
-def chat(req: ChatRequest, x_vera_secret: Optional[str] = Header(None)):
-    check_secret(x_vera_secret)
+def chat(req: ChatRequest):
     reply = process_user_message(req.message, channel="app")
     return {"reply": reply}
 
 
 @app.post("/speak")
-async def speak(req: SpeakRequest, x_vera_secret: Optional[str] = Header(None)):
-    check_secret(x_vera_secret)
+async def speak(req: SpeakRequest):
     clean_text = prepare_text_for_speech(req.text)
     if not clean_text:
         raise HTTPException(status_code=400, detail="Ovozga aylantirish uchun matn bo'sh")
@@ -575,14 +567,12 @@ async def speak(req: SpeakRequest, x_vera_secret: Optional[str] = Header(None)):
 
 
 @app.get("/reminders")
-def list_reminders_endpoint(x_vera_secret: Optional[str] = Header(None)):
-    check_secret(x_vera_secret)
+def list_reminders_endpoint():
     return json.loads(tool_list_reminders()) if tool_list_reminders() != "Hozircha faol eslatma yo'q." else []
 
 
 @app.get("/pending_notifications")
-def get_pending_notifications(x_vera_secret: Optional[str] = Header(None)):
-    check_secret(x_vera_secret)
+def get_pending_notifications():
     with _pending_lock:
         items = pending_notifications.copy()
         pending_notifications.clear()
@@ -598,5 +588,6 @@ if __name__ == "__main__":
     threading.Thread(target=reminder_checker_loop, daemon=True).start()
     threading.Thread(target=telegram_loop, daemon=True).start()
     print(f"Vera backend ishga tushdi: http://{HOST}:{PORT}")
-    print(f"Maxfiy kalit (ilovaga kerak bo'ladi): {APP_SECRET}")
+    print("Ogohlantirish: maxfiy kalit tekshiruvi o'chirilgan — bu manzilni "
+          "hech kimga bermang, aks holda har kim Vera bilan gaplasha oladi.")
     uvicorn.run(app, host=HOST, port=PORT)
