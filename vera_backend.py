@@ -505,6 +505,16 @@ def prepare_text_for_speech(raw: str) -> str:
 
     # Ortiqcha bo'sh joy va qatorlarni yig'ishtiramiz.
     t = re.sub(r"\s+", " ", t).strip()
+
+    # Xavfsizlik to'ri: matnda buzilgan/juft bo'lmagan surrogat belgilar
+    # bo'lishi mumkin (masalan, bazadan yoki JSON orqali noto'g'ri
+    # saqlangan emoji "yarmi"). Bunday belgilar UTF-8'ga kodlanganda
+    # UnicodeEncodeError berib, edge-tts'ni butunlay ishdan chiqaradi.
+    # Shuning uchun kodlab bo'lmaydigan har qanday belgini xavfsiz olib
+    # tashlaymiz — bu yaxshi matnga ta'sir qilmaydi, faqat buzilganini
+    # tozalaydi.
+    t = t.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+
     return t
 
 
@@ -533,6 +543,14 @@ async def synthesize_speech(text: str, rate_percent: int = 0) -> bytes:
             if attempt > 1:
                 print(f"[TTS] {attempt}-urinishda muvaffaqiyatli bo'ldi.")
             return bytes(audio_chunks)
+        except (UnicodeEncodeError, UnicodeDecodeError) as e:
+            # Matnda kodlanmaydigan belgi bor — qayta urinish foydasiz
+            # (bir xil matn, bir xil xato bo'ladi), shuning uchun darhol
+            # to'xtaymiz. (prepare_text_for_speech endi bunday belgilarni
+            # oldindan tozalaydi, shu sabab bu holat kam uchraydi.)
+            print(f"[TTS XATO] Matnda kodlanmaydigan belgi bor: "
+                  f"{type(e).__name__}: {e}")
+            raise RuntimeError(f"Matnda kodlanmaydigan belgi bor: {e}") from e
         except Exception as e:
             last_error = e
             print(f"[TTS XATO] {attempt}-urinish muvaffaqiyatsiz: "
