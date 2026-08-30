@@ -57,6 +57,7 @@ XAVFSIZLIK:
 import os
 import re
 import json
+import asyncio
 import threading
 import time
 import datetime
@@ -508,14 +509,42 @@ def prepare_text_for_speech(raw: str) -> str:
 
 
 async def synthesize_speech(text: str, rate_percent: int = 0) -> bytes:
-    """MadinaNeural ovozida MP3 baytlarini generatsiya qiladi."""
+    """MadinaNeural ovozida MP3 baytlarini generatsiya qiladi.
+
+    Railway/bulutli serverlarda edge-tts vaqti-vaqti bilan
+    "NoAudioReceived" xatosini beradi (Microsoft'ning ichki xizmati
+    ba'zi bulutli IP-manzillarni cheklaydi/bloklaydi). Bu ko'pincha
+    vaqtinchalik bo'ladi, shuning uchun bir necha marta qayta urinamiz.
+    Har bir urinishdagi aniq xatoni ham logga yozamiz — shu orqali
+    muammo IP bloklanishimi yoki boshqa narsa ekanini bilib olamiz.
+    """
     rate_str = f"{rate_percent:+d}%"
-    communicate = edge_tts.Communicate(text, voice=VERA_VOICE, rate=rate_str)
-    audio_chunks = bytearray()
-    async for chunk in communicate.stream():
-        if chunk["type"] == "audio":
-            audio_chunks.extend(chunk["data"])
-    return bytes(audio_chunks)
+    last_error: Exception | None = None
+
+    for attempt in range(1, 4):
+        try:
+            communicate = edge_tts.Communicate(text, voice=VERA_VOICE, rate=rate_str)
+            audio_chunks = bytearray()
+            async for chunk in communicate.stream():
+                if chunk["type"] == "audio":
+                    audio_chunks.extend(chunk["data"])
+            if not audio_chunks:
+                raise RuntimeError("edge-tts bo'sh audio qaytardi (0 bayt)")
+            if attempt > 1:
+                print(f"[TTS] {attempt}-urinishda muvaffaqiyatli bo'ldi.")
+            return bytes(audio_chunks)
+        except Exception as e:
+            last_error = e
+            print(f"[TTS XATO] {attempt}-urinish muvaffaqiyatsiz: "
+                  f"{type(e).__name__}: {e}")
+            if attempt < 3:
+                await asyncio.sleep(1.5 * attempt)
+
+    # Uch marta urinib ham bo'lmasa — aniq xato bilan tashqariga chiqaramiz.
+    raise RuntimeError(
+        f"edge-tts 3 marta urinishdan keyin ham ishlamadi: "
+        f"{type(last_error).__name__}: {last_error}"
+    )
 
 
 class SpeakRequest(BaseModel):
@@ -562,6 +591,7 @@ async def speak(req: SpeakRequest):
         # baribir bajaradi, lekin javob vaqtini cheklash uchun kesamiz.
         audio_bytes = await synthesize_speech(clean_text[:2000], req.rate_percent)
     except Exception as e:
+        print(f"[SPEAK ENDPOINT XATO] {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Ovoz xizmati xatosi: {e}")
     return Response(content=audio_bytes, media_type="audio/mpeg")
 
@@ -591,4 +621,3 @@ if __name__ == "__main__":
     print("Ogohlantirish: maxfiy kalit tekshiruvi o'chirilgan — bu manzilni "
           "hech kimga bermang, aks holda har kim Vera bilan gaplasha oladi.")
     uvicorn.run(app, host=HOST, port=PORT)
-
