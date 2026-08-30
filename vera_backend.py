@@ -1,6 +1,6 @@
 """
 ==================================================================
- ULTRON — Shaxsiy AI yordamchi backend (1-bosqich + 2-bosqich MVP)
+ VERA — Shaxsiy AI yordamchi backend (1-bosqich + 2-bosqich MVP)
 ==================================================================
 
 Bu fayl quyidagilarni bajaradi:
@@ -11,20 +11,23 @@ Bu fayl quyidagilarni bajaradi:
   - Telegram bot orqali ham gaplashish imkoni (bir xil miya/xotira)
   - Fon rejimida eslatmalarni tekshirib, vaqti kelganda bildirish
   - Telefon/kompyuter (Flutter) ilova ulanadigan HTTP API
+  - O'ZBEKCHA OVOZ: /speak endpoint orqali matnni Microsoft Edge'ning
+    "uz-UZ-MadinaNeural" ovozida MP3'ga aylantirib qaytaradi (edge-tts
+    kutubxonasi orqali, API kalit talab qilinmaydi)
 
 MAHALLIY ISHGA TUSHIRISH (sinov uchun):
   1) Python 3.10+ kerak
   2) Terminalda:
-       pip install fastapi uvicorn requests psycopg2-binary
+       pip install fastapi uvicorn requests psycopg2-binary edge-tts
   3) Quyidagi CONFIG bo'limiga o'z ma'lumotlaringizni yozing
      (yoki muhit o'zgaruvchisi orqali bering)
   4) Ishga tushirish:
-       python ultron_backend.py
+       python vera_backend.py
      Server manzili:  http://<kompyuter-ip>:8000
 
 RAILWAY'GA JOYLASH:
-  1) Loyihani GitHub'ga yuklang (shu ultron_backend.py va requirements.txt
-     bilan — requirements.txt matnini shu fayl oxiridagi izohdan oling)
+  1) Loyihani GitHub'ga yuklang (shu vera_backend.py va alohida berilgan
+     requirements.txt fayli bilan birga)
   2) Railway'da "New Project" -> "Deploy from GitHub repo"
   3) Railway'da "New" -> "Database" -> "PostgreSQL" qo'shing.
      Railway avtomatik ravishda DATABASE_URL muhit o'zgaruvchisini
@@ -32,15 +35,16 @@ RAILWAY'GA JOYLASH:
      "Reference" qilasiz).
   4) Railway "Variables" bo'limida quyidagilarni qo'shing:
        ANTHROPIC_API_KEY = sizning Claude API kalitingiz
-       ULTRON_SECRET     = o'zingiz o'ylab topgan maxfiy kalit
+       VERA_SECRET       = o'zingiz o'ylab topgan maxfiy kalit
        TELEGRAM_BOT_TOKEN (ixtiyoriy)
        TELEGRAM_ALLOWED_CHAT_ID (ixtiyoriy)
+       VERA_VOICE (ixtiyoriy, standart: uz-UZ-MadinaNeural)
      PORT va DATABASE_URL'ni Railway o'zi avtomatik beradi — qo'lda
      kiritmang.
   5) "Start Command" sifatida quyidagini bering:
-       python ultron_backend.py
+       python vera_backend.py
   6) Deploy tugagach, Railway sizga ochiq URL beradi (masalan
-     https://ultron-production.up.railway.app) — shuni Flutter ilova
+     https://vera-production.up.railway.app) — shuni Flutter ilova
      sozlamalariga "Backend manzili" sifatida kiritasiz.
 
 XAVFSIZLIK:
@@ -49,6 +53,7 @@ XAVFSIZLIK:
 """
 
 import os
+import re
 import json
 import threading
 import time
@@ -56,8 +61,10 @@ import datetime
 from typing import List, Optional
 
 import requests
+import edge_tts  # pip install edge-tts — Microsoft Edge'ning bepul neural TTS'i
 from fastapi import FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn
 
@@ -71,14 +78,8 @@ ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "BU_YERGA_CLAUDE_API_KEY
 # Ishlatiladigan model
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 
-# Agar API kalitingiz "identity-linked" (bir nechta workspace'da ishlaydigan)
-# turdagi bo'lsa, Claude API har bir so'rovda anthropic-workspace-id headerini
-# talab qiladi. Shu yerga workspace ID'ingizni yozing (yoki Railway'da
-# ANTHROPIC_WORKSPACE_ID muhit o'zgaruvchisi orqali bering).
-ANTHROPIC_WORKSPACE_ID = os.environ.get("ANTHROPIC_WORKSPACE_ID", "wrkspc_01EE58rCLYsbcgK7mVUoRW38")
-
 # Ilova bilan backend o'rtasidagi maxfiy kalit (o'zingiz o'ylab toping)
-APP_SECRET = os.environ.get("ULTRON_SECRET", "ultron-maxfiy-kalit-almashtiring")
+APP_SECRET = os.environ.get("VERA_SECRET", "vera-maxfiy-kalit-almashtiring")
 
 # Telegram bot (ixtiyoriy). Bo'sh qoldirsangiz, Telegram ishlamaydi.
 # Bot yaratish: Telegram'da @BotFather ga yozing -> /newbot
@@ -87,11 +88,15 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # ID'ingizni bilish uchun Telegram'da @userinfobot ga yozing.
 TELEGRAM_ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID", "")
 
-DB_PATH = os.environ.get("ULTRON_DB", "ultron.db")
+# Ovoz — Microsoft Edge'ning bepul neural TTS xizmatidagi o'zbekcha ovoz.
+# To'liq ro'yxatni ko'rish uchun terminalda: edge-tts --list-voices | grep uz-UZ
+VERA_VOICE = os.environ.get("VERA_VOICE", "uz-UZ-MadinaNeural")
+
+DB_PATH = os.environ.get("VERA_DB", "vera.db")
 HOST = "0.0.0.0"
-# Railway PORT muhit o'zgaruvchisini avtomatik beradi; mahalliyda ULTRON_PORT
+# Railway PORT muhit o'zgaruvchisini avtomatik beradi; mahalliyda VERA_PORT
 # yoki standart 8000 ishlatiladi.
-PORT = int(os.environ.get("PORT", os.environ.get("ULTRON_PORT", "8000")))
+PORT = int(os.environ.get("PORT", os.environ.get("VERA_PORT", "8000")))
 
 # Railway PostgreSQL qo'shsangiz, DATABASE_URL avtomatik beriladi.
 # Bo'lmasa, mahalliy SQLite fayliga yoziladi (sinov uchun qulay).
@@ -303,8 +308,11 @@ CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 def build_system_prompt() -> str:
     now = datetime.datetime.now().isoformat(timespec="seconds")
     return (
-        "Sen Ultron ismli, foydalanuvchiga shaxsan xizmat qiladigan sun'iy intellekt "
-        "yordamchisisan. Har doim o'zbek tilida, tabiiy, samimiy va qisqa-lo'nda javob ber. "
+        "Sen Vera ismli, foydalanuvchiga shaxsan xizmat qiladigan, ayol ovozida gapiradigan "
+        "sun'iy intellekt yordamchisisan. Har doim o'zbek tilida, tabiiy, samimiy va "
+        "qisqa-lo'nda javob ber. "
+        "Javobing keyinchalik ovozda ham o'qiladi, shuning uchun markdown belgilari "
+        "(*, #, ``` va h.k.) ishlatma — oddiy, gapirishga mos matn yoz. "
         f"Hozirgi aniq sana va vaqt: {now}. "
         "Agar foydalanuvchi eslatma qo'shish, ko'rish yoki o'chirishni so'rasa, mos tool'dan "
         "foydalan. Nisbiy vaqtlarni ('ertaga', 'yarim soatdan keyin') hozirgi vaqtga qarab "
@@ -315,7 +323,7 @@ def build_system_prompt() -> str:
 def call_claude(messages: List[dict]) -> str:
     if not ANTHROPIC_API_KEY or "BU_YERGA" in ANTHROPIC_API_KEY:
         return (
-            "Claude API kaliti sozlanmagan. ultron_backend.py faylidagi "
+            "Claude API kaliti sozlanmagan. vera_backend.py faylidagi "
             "ANTHROPIC_API_KEY qiymatini to'ldiring."
         )
 
@@ -324,8 +332,6 @@ def call_claude(messages: List[dict]) -> str:
         "anthropic-version": "2023-06-01",
         "content-type": "application/json",
     }
-    if ANTHROPIC_WORKSPACE_ID:
-        headers["anthropic-workspace-id"] = ANTHROPIC_WORKSPACE_ID
 
     conversation = list(messages)
 
@@ -469,10 +475,60 @@ def telegram_loop():
 
 
 # ------------------------------------------------------------------
+# 6.5) OVOZ (TTS) — MadinaNeural orqali matnni ovozga aylantirish
+# ------------------------------------------------------------------
+
+_EMOJI_PATTERN = re.compile(
+    "[\U0001F300-\U0001FAFF\U00002600-\U000027BF\u2190-\u21FF\u2B00-\u2BFF]+"
+)
+
+
+def prepare_text_for_speech(raw: str) -> str:
+    """Matnni ovozli o'qish uchun tozalaydi (Flutter tomonidagi mantiqning
+    server tarafidagi nusxasi — Telegram va boshqa kanallar uchun ham
+    bir xil tozalash ishlashi uchun)."""
+    t = raw
+
+    # Turli apostrofsimon belgilarni standart shaklga keltiramiz.
+    t = re.sub(r"[\u2019\u2018`\u00b4]", "'", t)
+
+    # o'/g' (va O'/G') dagi apostrofni maxsus modifikator harfga
+    # (ʻ, U+02BB) almashtiramiz — tabiiy o'zbekcha talaffuz uchun.
+    t = re.sub(r"([oOgG])'", r"\1\u02bb", t)
+
+    # Emoji va nutqqa aloqasi yo'q belgilarni olib tashlaymiz.
+    t = _EMOJI_PATTERN.sub("", t)
+
+    # Markdown/ro'yxat belgilarini olib tashlaymiz.
+    t = re.sub(r"[*_#`~]", "", t)
+    t = re.sub(r"^[•\-]\s*", "", t, flags=re.MULTILINE)
+
+    # Ortiqcha bo'sh joy va qatorlarni yig'ishtiramiz.
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+async def synthesize_speech(text: str, rate_percent: int = 0) -> bytes:
+    """MadinaNeural ovozida MP3 baytlarini generatsiya qiladi."""
+    rate_str = f"{rate_percent:+d}%"
+    communicate = edge_tts.Communicate(text, voice=VERA_VOICE, rate=rate_str)
+    audio_chunks = bytearray()
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_chunks.extend(chunk["data"])
+    return bytes(audio_chunks)
+
+
+class SpeakRequest(BaseModel):
+    text: str
+    rate_percent: int = 0
+
+
+# ------------------------------------------------------------------
 # 7) HTTP API (Flutter ilova shu bilan gaplashadi)
 # ------------------------------------------------------------------
 
-app = FastAPI(title="Ultron Backend")
+app = FastAPI(title="Vera Backend")
 
 app.add_middleware(
     CORSMiddleware,
@@ -486,8 +542,8 @@ class ChatRequest(BaseModel):
     message: str
 
 
-def check_secret(x_ultron_secret: Optional[str]):
-    if x_ultron_secret != APP_SECRET:
+def check_secret(x_vera_secret: Optional[str]):
+    if x_vera_secret != APP_SECRET:
         raise HTTPException(status_code=401, detail="Noto'g'ri maxfiy kalit")
 
 
@@ -497,21 +553,36 @@ def health():
 
 
 @app.post("/chat")
-def chat(req: ChatRequest, x_ultron_secret: Optional[str] = Header(None)):
-    check_secret(x_ultron_secret)
+def chat(req: ChatRequest, x_vera_secret: Optional[str] = Header(None)):
+    check_secret(x_vera_secret)
     reply = process_user_message(req.message, channel="app")
     return {"reply": reply}
 
 
+@app.post("/speak")
+async def speak(req: SpeakRequest, x_vera_secret: Optional[str] = Header(None)):
+    check_secret(x_vera_secret)
+    clean_text = prepare_text_for_speech(req.text)
+    if not clean_text:
+        raise HTTPException(status_code=400, detail="Ovozga aylantirish uchun matn bo'sh")
+    try:
+        # Xat-boshi juda uzun bo'lsa (masalan uzun tushuntirish), edge-tts
+        # baribir bajaradi, lekin javob vaqtini cheklash uchun kesamiz.
+        audio_bytes = await synthesize_speech(clean_text[:2000], req.rate_percent)
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Ovoz xizmati xatosi: {e}")
+    return Response(content=audio_bytes, media_type="audio/mpeg")
+
+
 @app.get("/reminders")
-def list_reminders_endpoint(x_ultron_secret: Optional[str] = Header(None)):
-    check_secret(x_ultron_secret)
+def list_reminders_endpoint(x_vera_secret: Optional[str] = Header(None)):
+    check_secret(x_vera_secret)
     return json.loads(tool_list_reminders()) if tool_list_reminders() != "Hozircha faol eslatma yo'q." else []
 
 
 @app.get("/pending_notifications")
-def get_pending_notifications(x_ultron_secret: Optional[str] = Header(None)):
-    check_secret(x_ultron_secret)
+def get_pending_notifications(x_vera_secret: Optional[str] = Header(None)):
+    check_secret(x_vera_secret)
     with _pending_lock:
         items = pending_notifications.copy()
         pending_notifications.clear()
@@ -526,6 +597,6 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=reminder_checker_loop, daemon=True).start()
     threading.Thread(target=telegram_loop, daemon=True).start()
-    print(f"Ultron backend ishga tushdi: http://{HOST}:{PORT}")
+    print(f"Vera backend ishga tushdi: http://{HOST}:{PORT}")
     print(f"Maxfiy kalit (ilovaga kerak bo'ladi): {APP_SECRET}")
     uvicorn.run(app, host=HOST, port=PORT)
