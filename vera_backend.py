@@ -493,7 +493,7 @@ def prepare_text_for_speech(raw: str) -> str:
 
     # o'/g' (va O'/G') dagi apostrofni maxsus modifikator harfga
     # (ʻ, U+02BB) almashtiramiz — tabiiy o'zbekcha talaffuz uchun.
-    t = re.sub(r"([oOgG])'", r"\1\u02bb", t)
+    t = re.sub(r"([oOgG])'", lambda m: m.group(1) + "\u02bb", t)
 
     # Emoji va nutqqa aloqasi yo'q belgilarni olib tashlaymiz.
     t = _EMOJI_PATTERN.sub("", t)
