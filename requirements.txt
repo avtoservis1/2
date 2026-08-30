@@ -1,5 +1,6 @@
 fastapi
 uvicorn
 requests
-pydantic
 psycopg2-binary
+edge-tts
+pydantic
