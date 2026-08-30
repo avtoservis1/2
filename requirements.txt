@@ -3,4 +3,4 @@ uvicorn
 requests
 psycopg2-binary
 edge-tts
-pydantic
+pydub
