@@ -583,12 +583,20 @@ async def synthesize_speech(
     )
 
 
-def tighten_pauses(audio_bytes: bytes, max_pause_ms: int = 220) -> bytes:
+def tighten_pauses(
+    audio_bytes: bytes, max_pause_ms: int = 220, crossfade_ms: int = 20
+) -> bytes:
     """Gaplar orasidagi uzun jim (pauza) joylarni qisqartiradi, shunda
     Vera odamdek — gaplarni deyarli qo'shib, tabiiy nafas oralig'i bilan
     gapiradi. Microsoft edge-tts xizmati SSML <break> teglariga ruxsat
     bermaydi (faqat rate/pitch/volume), shuning uchun buni tayyor MP3
     ustida audio darajasida bajaramiz.
+
+    Bo'laklarni to'g'ridan-to'g'ri "yopishtirish" o'rniga CROSSFADE
+    (yumshoq o'tish) bilan ulaymiz — aks holda kesilgan joyda eshitiladigan
+    "klik"/tirsillash paydo bo'ladi va kesilgani bilinib qoladi. Crossfade
+    har ikki bo'lak ovozini bir necha o'n millisekund davomida asta-sekin
+    aralashtirib o'tkazadi, natijada chegara sezilmaydi.
 
     Agar biror sababdan ishlov muvaffaqiyatsiz bo'lsa, asl audio
     o'zgarishsiz qaytariladi — ovoz baribir eshitiladi, faqat pauzalar
@@ -602,14 +610,27 @@ def tighten_pauses(audio_bytes: bytes, max_pause_ms: int = 220) -> bytes:
         if not silences:
             return audio_bytes
 
-        result = AudioSegment.empty()
+        # Avval bo'laklar ro'yxatini tuzamiz: nutq bo'lagi, qisqartirilgan
+        # pauza, nutq bo'lagi, ... — keyin ularni birma-bir crossfade bilan
+        # ulaymiz.
+        segments: list[AudioSegment] = []
         prev_end = 0
         for start, end in silences:
-            result += audio[prev_end:start]
+            segments.append(audio[prev_end:start])
             pause_len = min(end - start, max_pause_ms)
-            result += AudioSegment.silent(duration=pause_len)
+            segments.append(AudioSegment.silent(duration=pause_len))
             prev_end = end
-        result += audio[prev_end:]
+        segments.append(audio[prev_end:])
+
+        result = segments[0]
+        for seg in segments[1:]:
+            # Crossfade ikkala bo'lakdan ham qisqaroq bo'lishi kerak,
+            # aks holda pydub xato beradi (masalan juda qisqa pauzalarda).
+            cf = min(crossfade_ms, len(result), len(seg))
+            if cf > 2:
+                result = result.append(seg, crossfade=cf)
+            else:
+                result += seg
 
         out = io.BytesIO()
         result.export(out, format="mp3")
@@ -618,6 +639,8 @@ def tighten_pauses(audio_bytes: bytes, max_pause_ms: int = 220) -> bytes:
         print(f"[TTS] Pauza qisqartirishda xato (asl audio ishlatiladi): "
               f"{type(e).__name__}: {e}")
         return audio_bytes
+
+
 
 
 class SpeakRequest(BaseModel):
