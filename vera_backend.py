@@ -56,6 +56,7 @@ XAVFSIZLIK:
 
 import os
 import re
+import io
 import json
 import asyncio
 import threading
@@ -70,6 +71,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel
 import uvicorn
+
+# pip install pydub — audio ustida ishlov berish (gaplar orasidagi uzun
+# pauzalarni qisqartirish) uchun. Bundan tashqari serverda "ffmpeg" dasturi
+# o'rnatilgan bo'lishi kerak (Railway uchun nixpacks.toml orqali).
+from pydub import AudioSegment
+from pydub.silence import detect_silence
 
 # ------------------------------------------------------------------
 # 1) CONFIG — shu yerga o'zingizning ma'lumotlaringizni yozing
@@ -518,8 +525,14 @@ def prepare_text_for_speech(raw: str) -> str:
     return t
 
 
-async def synthesize_speech(text: str, rate_percent: int = 0) -> bytes:
+async def synthesize_speech(
+    text: str, rate_percent: int = 0, pitch_percent: int = 0
+) -> bytes:
     """MadinaNeural ovozida MP3 baytlarini generatsiya qiladi.
+
+    pitch_percent: ovoz balandligini o'zgartiradi (-50 dan +50 gacha,
+    edge-tts'ga "+NHz" shaklida yuboriladi). Musbat qiymat ovozni
+    balandroq va yoshroq/shiraliroq eshitiladigan qiladi.
 
     Railway/bulutli serverlarda edge-tts vaqti-vaqti bilan
     "NoAudioReceived" xatosini beradi (Microsoft'ning ichki xizmati
@@ -529,11 +542,16 @@ async def synthesize_speech(text: str, rate_percent: int = 0) -> bytes:
     muammo IP bloklanishimi yoki boshqa narsa ekanini bilib olamiz.
     """
     rate_str = f"{rate_percent:+d}%"
+    # edge-tts pitch qiymatini Hz sifatida kutadi; foizni taxminan Hz'ga
+    # aylantiramiz (har 1% ≈ 2Hz, odatiy ovoz diapazoni uchun yetarli).
+    pitch_str = f"{pitch_percent * 2:+d}Hz"
     last_error: Exception | None = None
 
     for attempt in range(1, 4):
         try:
-            communicate = edge_tts.Communicate(text, voice=VERA_VOICE, rate=rate_str)
+            communicate = edge_tts.Communicate(
+                text, voice=VERA_VOICE, rate=rate_str, pitch=pitch_str
+            )
             audio_chunks = bytearray()
             async for chunk in communicate.stream():
                 if chunk["type"] == "audio":
@@ -565,9 +583,47 @@ async def synthesize_speech(text: str, rate_percent: int = 0) -> bytes:
     )
 
 
+def tighten_pauses(audio_bytes: bytes, max_pause_ms: int = 220) -> bytes:
+    """Gaplar orasidagi uzun jim (pauza) joylarni qisqartiradi, shunda
+    Vera odamdek — gaplarni deyarli qo'shib, tabiiy nafas oralig'i bilan
+    gapiradi. Microsoft edge-tts xizmati SSML <break> teglariga ruxsat
+    bermaydi (faqat rate/pitch/volume), shuning uchun buni tayyor MP3
+    ustida audio darajasida bajaramiz.
+
+    Agar biror sababdan ishlov muvaffaqiyatsiz bo'lsa, asl audio
+    o'zgarishsiz qaytariladi — ovoz baribir eshitiladi, faqat pauzalar
+    qisqarmagan bo'ladi.
+    """
+    try:
+        audio = AudioSegment.from_file(io.BytesIO(audio_bytes), format="mp3")
+        silences = detect_silence(
+            audio, min_silence_len=280, silence_thresh=audio.dBFS - 16
+        )
+        if not silences:
+            return audio_bytes
+
+        result = AudioSegment.empty()
+        prev_end = 0
+        for start, end in silences:
+            result += audio[prev_end:start]
+            pause_len = min(end - start, max_pause_ms)
+            result += AudioSegment.silent(duration=pause_len)
+            prev_end = end
+        result += audio[prev_end:]
+
+        out = io.BytesIO()
+        result.export(out, format="mp3")
+        return out.getvalue()
+    except Exception as e:
+        print(f"[TTS] Pauza qisqartirishda xato (asl audio ishlatiladi): "
+              f"{type(e).__name__}: {e}")
+        return audio_bytes
+
+
 class SpeakRequest(BaseModel):
     text: str
     rate_percent: int = 0
+    pitch_percent: int = 0
 
 
 # ------------------------------------------------------------------
@@ -607,7 +663,12 @@ async def speak(req: SpeakRequest):
     try:
         # Xat-boshi juda uzun bo'lsa (masalan uzun tushuntirish), edge-tts
         # baribir bajaradi, lekin javob vaqtini cheklash uchun kesamiz.
-        audio_bytes = await synthesize_speech(clean_text[:2000], req.rate_percent)
+        audio_bytes = await synthesize_speech(
+            clean_text[:2000], req.rate_percent, req.pitch_percent
+        )
+        # Gaplar orasidagi uzun pauzalarni qisqartirib, tabiiyroq,
+        # gaplari bir-biriga qo'shilib ketadigan qilib beramiz.
+        audio_bytes = tighten_pauses(audio_bytes)
     except Exception as e:
         print(f"[SPEAK ENDPOINT XATO] {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Ovoz xizmati xatosi: {e}")
