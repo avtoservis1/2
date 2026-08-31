@@ -158,6 +158,15 @@ def init_db():
                     created_at TEXT NOT NULL
                 )"""
             )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS notifications(
+                    id SERIAL PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    is_read INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )"""
+            )
         else:
             cur.execute(
                 """CREATE TABLE IF NOT EXISTS messages(
@@ -175,6 +184,15 @@ def init_db():
                     due_time TEXT NOT NULL,
                     done INTEGER DEFAULT 0,
                     notified INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS notifications(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    type TEXT NOT NULL,
+                    text TEXT NOT NULL,
+                    is_read INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL
                 )"""
             )
@@ -292,6 +310,27 @@ TOOLS_SCHEMA = [
             "required": ["id"],
         },
     },
+    {
+        "name": "notify_progress",
+        "description": (
+            "Foydalanuvchiga ilova bildirishnomalar markazi va Telegram orqali "
+            "qisqa xabar yuboradi — masalan uzoq davom etadigan vazifa "
+            "(loyiha, kod yozish, build) boshlanganda, oraliq holatida yoki "
+            "tugaganda foydalaning. Oddiy suhbat javoblari uchun ishlatmang, "
+            "faqat foydalanuvchi ilova ochiq bo'lmasa ham bilishi kerak bo'lgan "
+            "muhim holat yangilanishlari uchun."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Qisqa, aniq xabar matni, masalan: 'Loyiha tayyor bo'ldi' yoki 'Backend deploy qilinmoqda, 5 daqiqa kutish kerak'.",
+                }
+            },
+            "required": ["text"],
+        },
+    },
 ]
 
 
@@ -302,6 +341,8 @@ def run_tool(name: str, tool_input: dict) -> str:
         return tool_list_reminders()
     if name == "delete_reminder":
         return tool_delete_reminder(int(tool_input.get("id", -1)))
+    if name == "notify_progress":
+        return tool_notify_progress(tool_input.get("text", ""))
     return f"Noma'lum tool: {name}"
 
 
@@ -323,7 +364,9 @@ def build_system_prompt() -> str:
         f"Hozirgi aniq sana va vaqt: {now}. "
         "Agar foydalanuvchi eslatma qo'shish, ko'rish yoki o'chirishni so'rasa, mos tool'dan "
         "foydalan. Nisbiy vaqtlarni ('ertaga', 'yarim soatdan keyin') hozirgi vaqtga qarab "
-        "aniq ISO sanaga aylantirib ber."
+        "aniq ISO sanaga aylantirib ber. Agar uzoq davom etadigan vazifa (masalan loyiha "
+        "ustida ishlash, kod yozish) haqida gap ketsa va foydalanuvchi keyinroq holatini "
+        "bilishi kerak bo'lsa, notify_progress tool'idan foydalanib bildirishnoma yubor."
     )
 
 
@@ -352,7 +395,9 @@ def call_claude(messages: List[dict]) -> str:
         }
         resp = requests.post(CLAUDE_API_URL, headers=headers, json=payload, timeout=60)
         if resp.status_code != 200:
-            return f"Claude API xatosi ({resp.status_code}): {resp.text[:300]}"
+            err_msg = f"Claude API xatosi ({resp.status_code}): {resp.text[:300]}"
+            add_notification("error", err_msg, also_telegram=False)
+            return err_msg
 
         data = resp.json()
         content_blocks = data.get("content", [])
@@ -391,12 +436,81 @@ def process_user_message(user_text: str, channel: str) -> str:
     return reply
 
 
+def process_user_image(image_b64: str, media_type: str, caption: str, channel: str) -> str:
+    """Skrinshot/kod rasmi yoki oddiy foto yuborilganda ishlaydi. Rasmni
+    Claude'ning vision imkoniyati orqali tahlil qildiradi va natijani oddiy
+    suhbat tarixiga ham yozadi, shunda keyingi savollarda ("bu xatoni qanday
+    tuzataman?") kontekst saqlanadi."""
+    user_label = caption.strip() if caption.strip() else "(rasm yuborildi)"
+    save_message("user", user_label, channel)
+    history = get_recent_history(limit=16)
+    # Oxirgi (hozirgina saqlangan) matnli xabarni rasm bilan almashtiramiz,
+    # chunki Claude API'ga rasm alohida content-blok sifatida yuborilishi kerak.
+    if history and history[-1]["role"] == "user":
+        history = history[:-1]
+    history.append(
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": image_b64,
+                    },
+                },
+                {
+                    "type": "text",
+                    "text": caption.strip() or (
+                        "Bu rasmda nima ko'rsatilganini tahlil qil. Agar bu "
+                        "kod yoki xato skrinshoti bo'lsa, sababini tushuntirib, "
+                        "yechim taklif qil."
+                    ),
+                },
+            ],
+        }
+    )
+    reply = call_claude(history)
+    save_message("assistant", reply, channel)
+    return reply
+
+
 # ------------------------------------------------------------------
 # 5) FON JARAYONI — eslatmalarni tekshirish
 # ------------------------------------------------------------------
 
 pending_notifications: List[dict] = []
 _pending_lock = threading.Lock()
+
+
+def add_notification(ntype: str, text: str, also_telegram: bool = True) -> str:
+    """Bildirishnomalar markaziga yozadi (ilova /notifications orqali o'qiydi)
+    va, agar so'ralsa, Telegram orqali ham darhol xabar beradi. Reminder,
+    task holati (masalan "loyiha tayyor bo'ldi") va xatoliklar shu orqali
+    ilovaga yetib boradi."""
+    now_iso = datetime.datetime.now().isoformat()
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"INSERT INTO notifications(type, text, created_at) VALUES ({PARAM}, {PARAM}, {PARAM})",
+            (ntype, text, now_iso),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    if also_telegram:
+        icon = {"reminder": "⏰", "task": "✅", "error": "⚠️"}.get(ntype, "🔔")
+        send_telegram_message(f"{icon} {text}")
+    return "Bildirishnoma yuborildi."
+
+
+def tool_notify_progress(text: str) -> str:
+    """Claude tool sifatida chaqiradi — masalan uzoq vazifa ustida ishlayotganda
+    ('loyihani boshladim', '50% tayyor') yoki tugaganda ('loyiha tayyor bo'ldi')
+    foydalanuvchiga xabar berish uchun."""
+    return add_notification("task", text)
 
 
 def send_telegram_message(text: str):
@@ -434,8 +548,7 @@ def reminder_checker_loop():
                 conn.close()
 
             for r in rows:
-                msg = f"⏰ Eslatma: {r[1]}"
-                send_telegram_message(msg)
+                add_notification("reminder", f"Eslatma: {r[1]}")
                 with _pending_lock:
                     pending_notifications.append({"id": r[0], "text": r[1]})
         except Exception as e:
@@ -667,6 +780,16 @@ class ChatRequest(BaseModel):
     message: str
 
 
+class ChatImageRequest(BaseModel):
+    image_base64: str
+    media_type: str = "image/png"
+    caption: str = ""
+
+
+class NotificationReadRequest(BaseModel):
+    id: int | None = None  # None bo'lsa — barchasi o'qilgan deb belgilanadi
+
+
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.datetime.now().isoformat()}
@@ -676,6 +799,63 @@ def health():
 def chat(req: ChatRequest):
     reply = process_user_message(req.message, channel="app")
     return {"reply": reply}
+
+
+@app.post("/chat_image")
+def chat_image(req: ChatImageRequest):
+    """Ilovadan skrinshot/kod rasmi yoki galereya rasmi yuborilganda ishlatiladi."""
+    if not req.image_base64:
+        raise HTTPException(status_code=400, detail="Rasm ma'lumoti bo'sh")
+    try:
+        reply = process_user_image(req.image_base64, req.media_type, req.caption, channel="app")
+    except Exception as e:
+        add_notification("error", f"Rasm tahlilida xato: {e}", also_telegram=False)
+        raise HTTPException(status_code=502, detail=f"Rasmni tahlil qilishda xato: {e}")
+    return {"reply": reply}
+
+
+@app.get("/notifications")
+def list_notifications(limit: int = 50):
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id, type, text, is_read, created_at FROM notifications "
+            f"ORDER BY id DESC LIMIT {PARAM}",
+            (limit,),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    return {
+        "notifications": [
+            {
+                "id": r[0],
+                "type": r[1],
+                "text": r[2],
+                "is_read": bool(r[3]),
+                "created_at": r[4],
+            }
+            for r in rows
+        ]
+    }
+
+
+@app.post("/notifications/read")
+def mark_notifications_read(req: NotificationReadRequest):
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if req.id is None:
+            cur.execute("UPDATE notifications SET is_read = 1 WHERE is_read = 0")
+        else:
+            cur.execute(
+                f"UPDATE notifications SET is_read = 1 WHERE id = {PARAM}", (req.id,)
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+    return {"status": "ok"}
 
 
 @app.post("/speak")
