@@ -68,7 +68,7 @@ import requests
 import edge_tts  # pip install edge-tts — Microsoft Edge'ning bepul neural TTS'i
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -428,6 +428,154 @@ def call_claude(messages: List[dict]) -> str:
     return "Kechirasiz, so'rovni bajarishda muammo yuzaga keldi (tool aylana limiti)."
 
 
+# Gap oxirini aniqlash uchun: '.', '!', '?', '…' dan keyingi bo'shliqda
+# bo'lamiz. Bu orqali Claude javobni hali to'liq yozib bo'lmasdan turib,
+# tayyor bo'lgan birinchi gapni darhol frontendga (va u orqali TTS'ga)
+# yuborish mumkin bo'ladi — shu narsa javobni "odamdek tez" qiladi.
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?\u2026])\s+")
+
+
+def call_claude_stream(messages: List[dict]):
+    """call_claude bilan bir xil ishlaydi (tool-chaqiruvlarni ham qo'llab-
+    quvvatlaydi), lekin natijani bitta katta matn sifatida emas, balki
+    tayyor bo'lgan GAPLAR (jumlalar) oqimi sifatida generator orqali
+    qaytaradi. Shu tufayli chaqiruvchi (masalan /chat_stream endpoint)
+    Claude hali javobni "yozib" turgan paytdayoq birinchi gapni darhol
+    ovozga aylantirib yuborishi mumkin — foydalanuvchi butun javobni
+    kutmaydi, Vera odamdek tez javob qaytargandek tuyuladi."""
+    if not ANTHROPIC_API_KEY or "BU_YERGA" in ANTHROPIC_API_KEY:
+        yield ("Claude API kaliti sozlanmagan. vera_backend.py faylidagi "
+               "ANTHROPIC_API_KEY qiymatini to'ldiring.")
+        return
+
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json",
+    }
+    conversation = list(messages)
+
+    for _ in range(5):  # tool-chaqiruv aylanalari uchun limit
+        payload = {
+            "model": CLAUDE_MODEL,
+            "max_tokens": 1024,
+            "system": build_system_prompt(),
+            "messages": conversation,
+            "tools": TOOLS_SCHEMA,
+            "stream": True,
+        }
+
+        buffer = ""  # navbatdagi (hali tugamagan) gapni yig'ib boradi
+        blocks: dict[int, dict] = {}  # index -> {"type": ..., "text"/"json": ...}
+        stop_reason = None
+        event_name = None
+
+        try:
+            with requests.post(
+                CLAUDE_API_URL, headers=headers, json=payload, timeout=90, stream=True
+            ) as resp:
+                if resp.status_code != 200:
+                    err_msg = f"Claude API xatosi ({resp.status_code}): {resp.text[:300]}"
+                    add_notification("error", err_msg, also_telegram=False)
+                    yield err_msg
+                    return
+
+                for raw_line in resp.iter_lines(decode_unicode=True):
+                    if not raw_line:
+                        continue
+                    if raw_line.startswith("event:"):
+                        event_name = raw_line[len("event:"):].strip()
+                        continue
+                    if not raw_line.startswith("data:"):
+                        continue
+                    data_str = raw_line[len("data:"):].strip()
+                    if not data_str:
+                        continue
+                    try:
+                        evt = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event_name == "content_block_start":
+                        idx = evt["index"]
+                        block = evt["content_block"]
+                        if block.get("type") == "tool_use":
+                            blocks[idx] = {
+                                "type": "tool_use",
+                                "name": block.get("name"),
+                                "id": block.get("id"),
+                                "json": "",
+                            }
+                        else:
+                            blocks[idx] = {"type": "text", "text": ""}
+
+                    elif event_name == "content_block_delta":
+                        idx = evt["index"]
+                        delta = evt.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            piece = delta.get("text", "")
+                            blocks[idx]["text"] += piece
+                            buffer += piece
+                            parts = _SENTENCE_END_RE.split(buffer)
+                            if len(parts) > 1:
+                                for sent in parts[:-1]:
+                                    sent = sent.strip()
+                                    if sent:
+                                        yield sent
+                                buffer = parts[-1]
+                        elif delta.get("type") == "input_json_delta":
+                            blocks[idx]["json"] += delta.get("partial_json", "")
+
+                    elif event_name == "message_delta":
+                        sr = evt.get("delta", {}).get("stop_reason")
+                        if sr:
+                            stop_reason = sr
+
+                    elif event_name == "message_stop":
+                        break
+        except requests.RequestException as e:
+            yield f"Ulanishda xato: {e}"
+            return
+
+        leftover = buffer.strip()
+        if leftover:
+            yield leftover
+
+        content_blocks = []
+        for idx in sorted(blocks):
+            b = blocks[idx]
+            if b["type"] == "text":
+                content_blocks.append({"type": "text", "text": b["text"]})
+            else:
+                try:
+                    tool_input = json.loads(b["json"]) if b["json"] else {}
+                except json.JSONDecodeError:
+                    tool_input = {}
+                content_blocks.append(
+                    {"type": "tool_use", "id": b["id"], "name": b["name"], "input": tool_input}
+                )
+        conversation.append({"role": "assistant", "content": content_blocks})
+
+        if stop_reason == "tool_use":
+            tool_results = []
+            for b in content_blocks:
+                if b.get("type") == "tool_use":
+                    result_text = run_tool(b["name"], b.get("input", {}))
+                    tool_results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": b["id"],
+                            "content": result_text,
+                        }
+                    )
+            conversation.append({"role": "user", "content": tool_results})
+            continue  # tool natijasi bilan yakuniy (matnli) javobni yana stream qilamiz
+
+        return  # yakuniy matnli javob tugadi
+
+    yield "Kechirasiz, so'rovni bajarishda muammo yuzaga keldi (tool aylana limiti)."
+
+
 def process_user_message(user_text: str, channel: str) -> str:
     save_message("user", user_text, channel)
     history = get_recent_history(limit=16)
@@ -697,7 +845,7 @@ async def synthesize_speech(
 
 
 def tighten_pauses(
-    audio_bytes: bytes, max_pause_ms: int = 220, crossfade_ms: int = 20
+    audio_bytes: bytes, max_pause_ms: int = 180, fade_ms: int = 12
 ) -> bytes:
     """Gaplar orasidagi uzun jim (pauza) joylarni qisqartiradi, shunda
     Vera odamdek — gaplarni deyarli qo'shib, tabiiy nafas oralig'i bilan
@@ -705,11 +853,16 @@ def tighten_pauses(
     bermaydi (faqat rate/pitch/volume), shuning uchun buni tayyor MP3
     ustida audio darajasida bajaramiz.
 
-    Bo'laklarni to'g'ridan-to'g'ri "yopishtirish" o'rniga CROSSFADE
-    (yumshoq o'tish) bilan ulaymiz — aks holda kesilgan joyda eshitiladigan
-    "klik"/tirsillash paydo bo'ladi va kesilgani bilinib qoladi. Crossfade
-    har ikki bo'lak ovozini bir necha o'n millisekund davomida asta-sekin
-    aralashtirib o'tkazadi, natijada chegara sezilmaydi.
+    ESLATMA: oldingi versiyada bo'laklarni CROSSFADE (bir-biriga
+    aralashtirib) ulash ishlatilgan edi — bu bir so'zning oxirgi tovushini
+    keyingi so'zning boshlang'ich tovushiga aralashtirib yuborib,
+    talaffuzni buzardi va aynan shu "buzilish" eshituvchiga sezilib
+    qolardi. Shuning uchun endi CROSSFADE o'rniga har bir nutq bo'lagining
+    boshi/oxiriga juda qisqa (bir necha millisekundlik) FADE (ovoz
+    balandligini asta pasaytirish/ko'tarish, mazmunga tegmasdan) qo'llanadi
+    — bu faqat kesilgan joydagi "klik" tovushining oldini oladi, so'zlarni
+    bir-biriga aralashtirmaydi. Pauzaning o'zi esa aralashtirilmasdan,
+    shunchaki qisqartirilgan holda saqlanadi.
 
     Agar biror sababdan ishlov muvaffaqiyatsiz bo'lsa, asl audio
     o'zgarishsiz qaytariladi — ovoz baribir eshitiladi, faqat pauzalar
@@ -723,27 +876,21 @@ def tighten_pauses(
         if not silences:
             return audio_bytes
 
-        # Avval bo'laklar ro'yxatini tuzamiz: nutq bo'lagi, qisqartirilgan
-        # pauza, nutq bo'lagi, ... — keyin ularni birma-bir crossfade bilan
-        # ulaymiz.
-        segments: list[AudioSegment] = []
+        result = AudioSegment.empty()
         prev_end = 0
         for start, end in silences:
-            segments.append(audio[prev_end:start])
+            speech = audio[prev_end:start]
+            if len(speech) > fade_ms * 2:
+                speech = speech.fade_in(fade_ms).fade_out(fade_ms)
+            result += speech
             pause_len = min(end - start, max_pause_ms)
-            segments.append(AudioSegment.silent(duration=pause_len))
+            result += AudioSegment.silent(duration=pause_len)
             prev_end = end
-        segments.append(audio[prev_end:])
 
-        result = segments[0]
-        for seg in segments[1:]:
-            # Crossfade ikkala bo'lakdan ham qisqaroq bo'lishi kerak,
-            # aks holda pydub xato beradi (masalan juda qisqa pauzalarda).
-            cf = min(crossfade_ms, len(result), len(seg))
-            if cf > 2:
-                result = result.append(seg, crossfade=cf)
-            else:
-                result += seg
+        tail = audio[prev_end:]
+        if len(tail) > fade_ms * 2:
+            tail = tail.fade_in(fade_ms)
+        result += tail
 
         out = io.BytesIO()
         result.export(out, format="mp3")
@@ -799,6 +946,36 @@ def health():
 def chat(req: ChatRequest):
     reply = process_user_message(req.message, channel="app")
     return {"reply": reply}
+
+
+@app.post("/chat_stream")
+def chat_stream(req: ChatRequest):
+    """/chat bilan bir xil ishlaydi, lekin javobni bitta butun matn
+    sifatida emas, balki har bir gap tayyor bo'lishi bilanoq alohida
+    voqea (SSE — Server-Sent Events) sifatida qaytaradi. Flutter ilova
+    har bir gapni kelishi bilan darhol ovozga aylantirib, navbat bilan
+    ijro etadi — shu sababli Vera butun javobni "o'ylab" chiqquncha
+    kutish o'rniga, odamga o'xshab tezroq gapira boshlaydi."""
+    save_message("user", req.message, "app")
+    history = get_recent_history(limit=16)
+
+    def event_gen():
+        full_parts: list[str] = []
+        try:
+            for sentence in call_claude_stream(history):
+                full_parts.append(sentence)
+                payload = json.dumps({"sentence": sentence}, ensure_ascii=False)
+                yield f"data: {payload}\n\n"
+        except Exception as e:
+            err = json.dumps({"error": str(e)}, ensure_ascii=False)
+            yield f"data: {err}\n\n"
+        finally:
+            full_reply = " ".join(full_parts).strip() or "(bo'sh javob)"
+            save_message("assistant", full_reply, "app")
+            done = json.dumps({"done": True}, ensure_ascii=False)
+            yield f"data: {done}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
 
 
 @app.post("/chat_image")
@@ -869,10 +1046,10 @@ async def speak(req: SpeakRequest):
         audio_bytes = await synthesize_speech(
             clean_text[:2000], req.rate_percent, req.pitch_percent
         )
-        # Eslatma: pauza qisqartirish (tighten_pauses) ataylab
-        # chaqirilmayapti — u audio bo'laklarini kesib-ulaganda sezilarli
-        # bo'lib qolgani uchun o'chirib qo'yildi. Endi asl, kesilmagan
-        # edge-tts audiosi to'g'ridan-to'g'ri qaytariladi.
+        # Gaplar orasidagi uzun pauzalarni qisqartiramiz. Yangi versiya
+        # CROSSFADE emas, faqat FADE ishlatadi (yuqoridagi izohga qarang),
+        # shuning uchun endi talaffuzni buzmasdan xavfsiz qo'llash mumkin.
+        audio_bytes = tighten_pauses(audio_bytes)
     except Exception as e:
         print(f"[SPEAK ENDPOINT XATO] {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Ovoz xizmati xatosi: {e}")
