@@ -444,6 +444,47 @@ def tool_pc_list_dir(path: str = "") -> str:
     return run_pc_command_and_wait("list_dir", {"path": path})
 
 
+def tool_pc_screen_size() -> str:
+    return run_pc_command_and_wait("get_screen_size", {})
+
+
+def tool_pc_mouse_move(x: int, y: int, duration: float = 0.2) -> str:
+    return run_pc_command_and_wait("mouse_move", {"x": x, "y": y, "duration": duration})
+
+
+def tool_pc_mouse_click(
+    x: int = None, y: int = None, button: str = "left", clicks: int = 1, double: bool = False
+) -> str:
+    params = {"button": button, "clicks": clicks, "double": double}
+    if x is not None and y is not None:
+        params["x"] = x
+        params["y"] = y
+    return run_pc_command_and_wait("mouse_click", params)
+
+
+def tool_pc_mouse_scroll(amount: int, x: int = None, y: int = None) -> str:
+    params = {"amount": amount}
+    if x is not None and y is not None:
+        params["x"] = x
+        params["y"] = y
+    return run_pc_command_and_wait("mouse_scroll", params)
+
+
+def tool_pc_mouse_drag(from_x: int, from_y: int, to_x: int, to_y: int, button: str = "left") -> str:
+    return run_pc_command_and_wait(
+        "mouse_drag",
+        {"from_x": from_x, "from_y": from_y, "to_x": to_x, "to_y": to_y, "button": button},
+    )
+
+
+def tool_pc_key_press(keys: str) -> str:
+    return run_pc_command_and_wait("key_press", {"keys": keys})
+
+
+def tool_pc_type_text(text: str) -> str:
+    return run_pc_command_and_wait("type_text", {"text": text})
+
+
 # ------------------------------------------------------------------
 # 3.6) GITHUB / CLAUDE CODE INTEGRATSIYASI
 # ------------------------------------------------------------------
@@ -715,6 +756,86 @@ TOOLS_SCHEMA = [
         },
     },
     {
+        "name": "pc_screen_size",
+        "description": "Windows kompyuterning ekran o'lchamini (kenglik x balandlik) va sichqoncha joriy pozitsiyasini qaytaradi. Sichqoncha bilan ishlashdan oldin ekran chegaralarini bilish uchun ishlating.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "pc_mouse_move",
+        "description": "Windows kompyuterda sichqonchani berilgan ekran koordinatasiga (piksel, chap-yuqori burchakdan hisoblanadi) ko'chiradi.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "X koordinata (piksel)."},
+                "y": {"type": "integer", "description": "Y koordinata (piksel)."},
+                "duration": {"type": "number", "description": "Ko'chish davomiyligi soniyada (ixtiyoriy, standart 0.2)."},
+            },
+            "required": ["x", "y"],
+        },
+    },
+    {
+        "name": "pc_mouse_click",
+        "description": "Windows kompyuterda sichqonchani bosadi — koordinata berilsa avval o'sha nuqtaga ko'chib, so'ng bosadi; berilmasa joriy pozitsiyada bosadi.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "X koordinata (ixtiyoriy)."},
+                "y": {"type": "integer", "description": "Y koordinata (ixtiyoriy)."},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Qaysi tugma (standart: left)."},
+                "clicks": {"type": "integer", "description": "Necha marta bosish (standart: 1)."},
+                "double": {"type": "boolean", "description": "true bo'lsa — double-click."},
+            },
+        },
+    },
+    {
+        "name": "pc_mouse_scroll",
+        "description": "Windows kompyuterda sahifani skroll qiladi. Musbat son — yuqoriga, manfiy son — pastga.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "amount": {"type": "integer", "description": "Skroll miqdori, masalan -500 (pastga) yoki 500 (yuqoriga)."},
+                "x": {"type": "integer", "description": "Skroll qilinadigan X koordinata (ixtiyoriy)."},
+                "y": {"type": "integer", "description": "Skroll qilinadigan Y koordinata (ixtiyoriy)."},
+            },
+            "required": ["amount"],
+        },
+    },
+    {
+        "name": "pc_mouse_drag",
+        "description": "Windows kompyuterda sichqonchani bir nuqtadan boshqasiga bosib turgan holda sudrab boradi (drag & drop).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "from_x": {"type": "integer"},
+                "from_y": {"type": "integer"},
+                "to_x": {"type": "integer"},
+                "to_y": {"type": "integer"},
+                "button": {"type": "string", "enum": ["left", "right", "middle"], "description": "Standart: left."},
+            },
+            "required": ["from_x", "from_y", "to_x", "to_y"],
+        },
+    },
+    {
+        "name": "pc_key_press",
+        "description": "Windows kompyuterda klaviatura tugmasini yoki tugma kombinatsiyasini bosadi (masalan 'enter', 'esc', 'ctrl+c', 'alt+tab', 'win+d').",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "keys": {"type": "string", "description": "'+' bilan ajratilgan tugma(lar), masalan 'ctrl+s' yoki 'enter'."}
+            },
+            "required": ["keys"],
+        },
+    },
+    {
+        "name": "pc_type_text",
+        "description": "Windows kompyuterda joriy faol maydonga matn yozadi (klaviatura orqali, xuddi foydalanuvchi terayotgandek). Faqat lotin/ASCII belgilar uchun ishonchli ishlaydi.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "Yoziladigan matn."}},
+            "required": ["text"],
+        },
+    },
+    {
         "name": "git_commit_and_push",
         "description": (
             "Windows kompyuterdagi repo papkasida barcha o'zgarishlarni commit qilib "
@@ -810,6 +931,40 @@ def run_tool(name: str, tool_input: dict) -> str:
         return tool_pc_status()
     if name == "pc_list_dir":
         return tool_pc_list_dir(tool_input.get("path", ""))
+    if name == "pc_screen_size":
+        return tool_pc_screen_size()
+    if name == "pc_mouse_move":
+        return tool_pc_mouse_move(
+            int(tool_input.get("x", 0)),
+            int(tool_input.get("y", 0)),
+            float(tool_input.get("duration", 0.2)),
+        )
+    if name == "pc_mouse_click":
+        return tool_pc_mouse_click(
+            tool_input.get("x"),
+            tool_input.get("y"),
+            tool_input.get("button", "left"),
+            int(tool_input.get("clicks", 1)),
+            bool(tool_input.get("double", False)),
+        )
+    if name == "pc_mouse_scroll":
+        return tool_pc_mouse_scroll(
+            int(tool_input.get("amount", -300)),
+            tool_input.get("x"),
+            tool_input.get("y"),
+        )
+    if name == "pc_mouse_drag":
+        return tool_pc_mouse_drag(
+            int(tool_input.get("from_x", 0)),
+            int(tool_input.get("from_y", 0)),
+            int(tool_input.get("to_x", 0)),
+            int(tool_input.get("to_y", 0)),
+            tool_input.get("button", "left"),
+        )
+    if name == "pc_key_press":
+        return tool_pc_key_press(tool_input.get("keys", ""))
+    if name == "pc_type_text":
+        return tool_pc_type_text(tool_input.get("text", ""))
     if name == "git_commit_and_push":
         return tool_git_commit_and_push(
             tool_input.get("commit_message", ""),
