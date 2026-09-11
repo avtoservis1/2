@@ -11,14 +11,22 @@ Bu fayl quyidagilarni bajaradi:
   - Telegram bot orqali ham gaplashish imkoni (bir xil miya/xotira)
   - Fon rejimida eslatmalarni tekshirib, vaqti kelganda bildirish
   - Telefon/kompyuter (Flutter) ilova ulanadigan HTTP API
-  - O'ZBEKCHA OVOZ: /speak endpoint orqali matnni Microsoft Edge'ning
-    "uz-UZ-MadinaNeural" ovozida MP3'ga aylantirib qaytaradi (edge-tts
-    kutubxonasi orqali, API kalit talab qilinmaydi)
+  - OVOZ (TTS): /speak endpoint orqali matnni OpenAI'ning nutq sintezi
+    (gpt-4o-mini-tts) orqali MP3'ga aylantirib qaytaradi (OPENAI_API_KEY
+    talab qilinadi)
+  - OVOZ (STT): /transcribe endpoint orqali ilova yozib olgan audio
+    (foydalanuvchi gapi) OpenAI'ning nutqni matnga aylantirish modeliga
+    (gpt-4o-mini-transcribe) yuboriladi va tanilgan matn qaytariladi
+    (xuddi shu OPENAI_API_KEY ishlatiladi, qo'shimcha kalit kerak emas)
+  - INTERNETDAN QIDIRISH / OB-HAVO / VALYUTA: Claude'ning o'zining
+    web_search vositasi orqali (qo'shimcha API kalit kerak emas)
+  - GITHUB: kod review, commit/push va Pull Request bilan ishlash
+    (GITHUB_TOKEN va GITHUB_REPO talab qilinadi)
 
 MAHALLIY ISHGA TUSHIRISH (sinov uchun):
   1) Python 3.10+ kerak
   2) Terminalda:
-       pip install fastapi uvicorn requests psycopg2-binary edge-tts
+       pip install fastapi uvicorn requests psycopg2-binary
   3) Quyidagi CONFIG bo'limiga o'z ma'lumotlaringizni yozing
      (yoki muhit o'zgaruvchisi orqali bering)
   4) Ishga tushirish:
@@ -35,9 +43,13 @@ RAILWAY'GA JOYLASH:
      "Reference" qilasiz).
   4) Railway "Variables" bo'limida quyidagilarni qo'shing:
        ANTHROPIC_API_KEY = sizning Claude API kalitingiz
+       OPENAI_API_KEY = sizning OpenAI API kalitingiz (ovoz uchun)
        TELEGRAM_BOT_TOKEN (ixtiyoriy)
        TELEGRAM_ALLOWED_CHAT_ID (ixtiyoriy)
-       VERA_VOICE (ixtiyoriy, standart: uz-UZ-MadinaNeural)
+       VERA_VOICE (ixtiyoriy, standart: nova)
+       OPENAI_STT_MODEL (ixtiyoriy, standart: gpt-4o-mini-transcribe)
+       GITHUB_TOKEN (ixtiyoriy, GitHub integratsiyasi uchun)
+       GITHUB_REPO (ixtiyoriy, masalan "foydalanuvchi/repo-nomi")
      PORT va DATABASE_URL'ni Railway o'zi avtomatik beradi — qo'lda
      kiritmang.
   5) "Start Command" sifatida quyidagini bering:
@@ -64,8 +76,9 @@ import time
 import datetime
 from typing import List
 
+import base64
+
 import requests
-import edge_tts  # pip install edge-tts — Microsoft Edge'ning bepul neural TTS'i
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response, StreamingResponse
@@ -95,9 +108,43 @@ TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 # ID'ingizni bilish uchun Telegram'da @userinfobot ga yozing.
 TELEGRAM_ALLOWED_CHAT_ID = os.environ.get("TELEGRAM_ALLOWED_CHAT_ID", "")
 
-# Ovoz — Microsoft Edge'ning bepul neural TTS xizmatidagi o'zbekcha ovoz.
-# To'liq ro'yxatni ko'rish uchun terminalda: edge-tts --list-voices | grep uz-UZ
-VERA_VOICE = os.environ.get("VERA_VOICE", "uz-UZ-MadinaNeural")
+# OVOZ (TTS) — endi OpenAI'ning nutq sintezi orqali ishlaydi (edge-tts
+# o'rniga). O'zbekcha uchun alohida "ovoz nomi" yo'q — OpenAI TTS modeli
+# matn tilini o'zi aniqlab, shu tilda tabiiy talaffuz qiladi. VERA_VOICE
+# orqali OpenAI ovozlaridan birini tanlaysiz: alloy, echo, fable, onyx,
+# nova, shimmer, coral, ash, sage — ayol ovoziga eng yaqinlari: "nova",
+# "shimmer", "coral".
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "BU_YERGA_OPENAI_API_KEYINGIZNI_YOZING")
+OPENAI_TTS_MODEL = os.environ.get("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+VERA_VOICE = os.environ.get("VERA_VOICE", "nova")
+# Ovozga "qanday ohangda gapirish kerak" haqida qisqa yo'riqnoma (faqat
+# gpt-4o-mini-tts modeli qo'llab-quvvatlaydi; eski tts-1 modellarida
+# e'tiborga olinmaydi, xato bermaydi).
+VERA_VOICE_STYLE = os.environ.get(
+    "VERA_VOICE_STYLE",
+    "Iliq, samimiy va tabiiy ohangda, o'zbek tilida, shoshilmasdan gapir.",
+)
+
+# GITHUB INTEGRATSIYASI — kod review, commit/push va Pull Request bilan
+# ishlash uchun. Token yaratish: github.com -> Settings -> Developer
+# settings -> Personal access tokens -> Fine-grained token (repo'ga
+# yozish huquqi bilan). GITHUB_REPO formati: "foydalanuvchi/repo-nomi".
+GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO = os.environ.get("GITHUB_REPO", "")
+GITHUB_DEFAULT_BASE_BRANCH = os.environ.get("GITHUB_DEFAULT_BASE_BRANCH", "main")
+GITHUB_API_URL = "https://api.github.com"
+
+# Windows kompyuteringizda ishlaydigan "agent" (windows_agent.py) shu tokenni
+# bilishi kerak — aks holda buyruqlarni olib bajara olmaydi. O'zingiz uzun,
+# tasodifiy qator o'ylab toping va ikkala tomonga (server + agent) bir xil
+# qiymatni bering.
+AGENT_TOKEN = os.environ.get("AGENT_TOKEN", "O'ZGARTIRING_MAXFIY_TOKEN")
+# Bitta vaqtda nechta kompyuter ulanishi mumkinligini nazorat qilish uchun
+# har bir agent o'zini nom bilan tanishtiradi (masalan "ish-kompyuteri").
+DEFAULT_AGENT_NAME = os.environ.get("DEFAULT_AGENT_NAME", "windows-pc")
+# Claude tool orqali buyruq yuborgach, Windows agentdan javob kelishini
+# necha soniya kutishi (agent odatda 1-3 soniyada so'raydi va bajaradi).
+PC_COMMAND_TIMEOUT_SEC = int(os.environ.get("PC_COMMAND_TIMEOUT_SEC", "25"))
 
 DB_PATH = os.environ.get("VERA_DB", "vera.db")
 HOST = "0.0.0.0"
@@ -167,6 +214,18 @@ def init_db():
                     created_at TEXT NOT NULL
                 )"""
             )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS pc_commands(
+                    id SERIAL PRIMARY KEY,
+                    agent_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    params TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    result TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
+                )"""
+            )
         else:
             cur.execute(
                 """CREATE TABLE IF NOT EXISTS messages(
@@ -194,6 +253,18 @@ def init_db():
                     text TEXT NOT NULL,
                     is_read INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS pc_commands(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    agent_name TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    params TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    result TEXT,
+                    created_at TEXT NOT NULL,
+                    completed_at TEXT
                 )"""
             )
         conn.commit()
@@ -280,7 +351,223 @@ def tool_delete_reminder(reminder_id: int) -> str:
     return f"ID={reminder_id} bo'lgan eslatma o'chirildi."
 
 
+# ------------------------------------------------------------------
+# 3.5) WINDOWS KOMPYUTERNI BOSHQARISH (buyruqlar navbati orqali)
+# ------------------------------------------------------------------
+#
+# Backend Windows kompyuterga to'g'ridan-to'g'ri ulanmaydi (kompyuter NAT
+# orqasida bo'lishi mumkin). Buning o'rniga: backend buyruqni "navbat"ga
+# (pc_commands jadvali) yozadi, kompyuterda doim ishlab turgan alohida
+# dastur (windows_agent.py) har 1-2 soniyada shu navbatni so'rab turadi,
+# topgan buyruqni bajaradi va natijasini qaytarib yuboradi. Claude tool
+# chaqirganda shu jarayon tugashini (yoki timeout bo'lishini) kutadi.
+
+def enqueue_pc_command(action: str, params: dict, agent_name: str = None) -> int:
+    agent_name = agent_name or DEFAULT_AGENT_NAME
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"INSERT INTO pc_commands(agent_name, action, params, created_at) "
+            f"VALUES ({PARAM}, {PARAM}, {PARAM}, {PARAM})"
+            + (" RETURNING id" if USE_POSTGRES else ""),
+            (agent_name, action, json.dumps(params, ensure_ascii=False),
+             datetime.datetime.now().isoformat()),
+        )
+        if USE_POSTGRES:
+            new_id = cur.fetchone()[0]
+        else:
+            new_id = cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+    return new_id
+
+
+def get_pc_command_status(command_id: int):
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT status, result FROM pc_commands WHERE id = {PARAM}", (command_id,)
+        )
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    return row  # (status, result) yoki None
+
+
+def run_pc_command_and_wait(action: str, params: dict, agent_name: str = None) -> str:
+    """Buyruqni navbatga qo'yadi va Windows agent bajarib, natija qaytargunicha
+    (yoki PC_COMMAND_TIMEOUT_SEC soniya o'tguncha) kutadi. Claude tool sifatida
+    chaqirganda ishlatiladi, shuning uchun natija darhol suhbatga qaytadi."""
+    command_id = enqueue_pc_command(action, params, agent_name)
+    deadline = time.time() + PC_COMMAND_TIMEOUT_SEC
+    while time.time() < deadline:
+        row = get_pc_command_status(command_id)
+        if row and row[0] in ("done", "error"):
+            status, result = row
+            prefix = "Bajarildi" if status == "done" else "Xatolik"
+            return f"{prefix}: {result or '(natija yo\u2019q)'}"
+        time.sleep(0.7)
+    return (
+        "Kompyuter javob bermadi (timeout). Windows agent dasturi (windows_agent.py) "
+        "kompyuteringizda ishlab turganini va internetga ulanganini tekshiring."
+    )
+
+
+def tool_pc_open_app(app_name: str) -> str:
+    return run_pc_command_and_wait("open_app", {"app_name": app_name})
+
+
+def tool_pc_close_app(app_name: str) -> str:
+    return run_pc_command_and_wait("close_app", {"app_name": app_name})
+
+
+def tool_pc_run_command(command: str) -> str:
+    return run_pc_command_and_wait("run_shell_command", {"command": command})
+
+
+def tool_pc_open_url(url: str) -> str:
+    return run_pc_command_and_wait("open_url", {"url": url})
+
+
+def tool_pc_power(action: str) -> str:
+    return run_pc_command_and_wait("system_power", {"action": action})
+
+
+def tool_pc_status() -> str:
+    return run_pc_command_and_wait("get_system_status", {})
+
+
+def tool_pc_list_dir(path: str = "") -> str:
+    return run_pc_command_and_wait("list_dir", {"path": path})
+
+
+# ------------------------------------------------------------------
+# 3.6) GITHUB / CLAUDE CODE INTEGRATSIYASI
+# ------------------------------------------------------------------
+#
+# Bu bo'lim ikki xil ishni ajratadi:
+#  - "git_commit_and_push" — mahalliy fayllarni commit qilish/push qilish
+#    Windows kompyuterdagi repo papkasida amalga oshadi, shuning uchun u
+#    mavjud pc_run_command mexanizmi (windows_agent.py) orqali ishlaydi.
+#  - "github_*" — GitHub'ning o'zidagi Pull Request va kod-review
+#    amallari, bular to'g'ridan-to'g'ri GitHub REST API'siga (GITHUB_TOKEN
+#    bilan) backend orqali murojaat qiladi, Windows kompyuter shart emas.
+
+def _check_github_config():
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        raise RuntimeError(
+            "GitHub sozlanmagan. Serverda GITHUB_TOKEN va GITHUB_REPO "
+            "muhit o'zgaruvchilarini o'rnating (masalan GITHUB_REPO="
+            "\"foydalanuvchi/repo-nomi\")."
+        )
+
+
+def _github_headers():
+    return {
+        "Authorization": f"Bearer {GITHUB_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+
+
+def tool_git_commit_and_push(commit_message: str, repo_path: str = "", branch: str = "") -> str:
+    """Windows kompyuterdagi repo papkasida `git add/commit/push` bajaradi.
+    repo_path berilmasa, agent hozirgi ishlab turgan papkasini ishlatadi
+    (odatda repo shu yerga clone qilingan bo'lishi kerak)."""
+    if not commit_message.strip():
+        return "Commit xabari bo'sh bo'lishi mumkin emas."
+    cd_part = f'cd /d "{repo_path}" && ' if repo_path.strip() else ""
+    branch_part = f" {branch.strip()}" if branch.strip() else ""
+    safe_message = commit_message.replace('"', "'")
+    command = (
+        f'{cd_part}git add -A && git commit -m "{safe_message}" '
+        f'&& git push origin{branch_part}'
+    )
+    return tool_pc_run_command(command)
+
+
+def tool_github_create_pr(title: str, head_branch: str, body: str = "", base_branch: str = "") -> str:
+    _check_github_config()
+    base_branch = base_branch.strip() or GITHUB_DEFAULT_BASE_BRANCH
+    resp = requests.post(
+        f"{GITHUB_API_URL}/repos/{GITHUB_REPO}/pulls",
+        headers=_github_headers(),
+        json={"title": title, "head": head_branch, "base": base_branch, "body": body},
+        timeout=30,
+    )
+    if resp.status_code not in (200, 201):
+        return f"PR yaratishda xato ({resp.status_code}): {resp.text[:300]}"
+    data = resp.json()
+    return f"PR #{data.get('number')} yaratildi: {data.get('html_url')}"
+
+
+def tool_github_list_open_prs() -> str:
+    _check_github_config()
+    resp = requests.get(
+        f"{GITHUB_API_URL}/repos/{GITHUB_REPO}/pulls",
+        headers=_github_headers(),
+        params={"state": "open", "per_page": 20},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        return f"PR ro'yxatini olishda xato ({resp.status_code}): {resp.text[:300]}"
+    prs = resp.json()
+    if not prs:
+        return "Hozircha ochiq Pull Request yo'q."
+    return json.dumps(
+        [
+            {
+                "number": pr["number"],
+                "title": pr["title"],
+                "author": pr["user"]["login"],
+                "url": pr["html_url"],
+                "branch": pr["head"]["ref"],
+            }
+            for pr in prs
+        ],
+        ensure_ascii=False,
+    )
+
+
+def tool_github_review_pr(pr_number: int) -> str:
+    """PR'ning diff (o'zgarishlar) matnini GitHub'dan olib, Claude'ga
+    tool_result sifatida qaytaradi — shundan keyin Claude shu diff'ni
+    o'qib, kod review sifatida fikr-mulohaza yozadi (xato, xavfsizlik,
+    uslub bo'yicha)."""
+    _check_github_config()
+    resp = requests.get(
+        f"{GITHUB_API_URL}/repos/{GITHUB_REPO}/pulls/{pr_number}",
+        headers={**_github_headers(), "Accept": "application/vnd.github.v3.diff"},
+        timeout=30,
+    )
+    if resp.status_code != 200:
+        return f"PR diff'ni olishda xato ({resp.status_code}): {resp.text[:300]}"
+    diff_text = resp.text[:12000]  # juda katta diff'larni kesib qo'yamiz
+    return f"PR #{pr_number} diff (review uchun):\n{diff_text}"
+
+
+def tool_github_post_pr_comment(pr_number: int, comment: str) -> str:
+    _check_github_config()
+    resp = requests.post(
+        f"{GITHUB_API_URL}/repos/{GITHUB_REPO}/issues/{pr_number}/comments",
+        headers=_github_headers(),
+        json={"body": comment},
+        timeout=30,
+    )
+    if resp.status_code not in (200, 201):
+        return f"Izoh qoldirishda xato ({resp.status_code}): {resp.text[:300]}"
+    return f"PR #{pr_number} ga izoh qoldirildi."
+
+
 TOOLS_SCHEMA = [
+    # OpenAI/Anthropic hosted vosita: Claude'ning o'zi internetdan qidiradi.
+    # Shu bitta vosita orqali "internetdan qidirish", "ob-havo", "valyuta
+    # kursi", "narx solishtirish" kabi barcha savollar javob topadi — bular
+    # uchun alohida weather/currency API kaliti kerak emas.
+    {"type": "web_search_20250305", "name": "web_search"},
     {
         "name": "add_reminder",
         "description": "Foydalanuvchi uchun aniq sana-vaqtli eslatma qo'shadi.",
@@ -331,6 +618,172 @@ TOOLS_SCHEMA = [
             "required": ["text"],
         },
     },
+    {
+        "name": "pc_open_app",
+        "description": (
+            "Windows kompyuterda dastur/ilova ochadi (masalan Chrome, VS Code, "
+            "Word, Spotify, Explorer). Faqat kompyuterni boshqarish so'ralganda ishlating."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Ochish kerak bo'lgan dastur nomi, masalan 'chrome', 'notepad', 'code', 'spotify'.",
+                }
+            },
+            "required": ["app_name"],
+        },
+    },
+    {
+        "name": "pc_close_app",
+        "description": "Windows kompyuterda ishlab turgan dasturni majburan yopadi (jarayon nomi bo'yicha).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "app_name": {
+                    "type": "string",
+                    "description": "Yopish kerak bo'lgan dastur/jarayon nomi, masalan 'chrome', 'notepad.exe'.",
+                }
+            },
+            "required": ["app_name"],
+        },
+    },
+    {
+        "name": "pc_run_command",
+        "description": (
+            "Windows kompyuterda terminal (cmd/PowerShell) buyrug'ini ishga tushiradi va "
+            "natijasini qaytaradi. Fayl bilan ishlash, papka ochish, dastur o'rnatish, "
+            "build/deploy kabi murakkab amallar uchun ishlating. Xavfli buyruqlarga "
+            "(diskni formatlash, muhim fayllarni o'chirish) ehtiyot bo'ling."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": "To'liq terminal buyrug'i, masalan 'dir C:\\Users' yoki 'git status'.",
+                }
+            },
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "pc_open_url",
+        "description": "Windows kompyuterda standart brauzerda berilgan saytni ochadi.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"url": {"type": "string", "description": "To'liq URL manzil."}},
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "pc_power",
+        "description": "Windows kompyuterni boshqaradi: qulflash, uyquga yuborish, qayta yuklash yoki o'chirish.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["lock", "sleep", "restart", "shutdown"],
+                    "description": "Bajariladigan amal.",
+                }
+            },
+            "required": ["action"],
+        },
+    },
+    {
+        "name": "pc_status",
+        "description": "Windows kompyuterning joriy holatini qaytaradi: protsessor/xotira yuklamasi, batareya, ishlayotgan asosiy dasturlar.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "pc_list_dir",
+        "description": (
+            "Windows kompyuterdagi berilgan papkadagi fayl va papkalar ro'yxatini "
+            "qaytaradi (nomi, turi, hajmi). Foydalanuvchi 'kompyuterimdagi fayllarni "
+            "ko'rsat', 'Downloads papkasida nima bor' kabi so'ragan hollarda ishlating."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "To'liq papka manzili, masalan 'C:\\\\Users\\\\User\\\\Downloads'. Bo'sh qoldirilsa, foydalanuvchi profil papkasi ko'rsatiladi.",
+                }
+            },
+        },
+    },
+    {
+        "name": "git_commit_and_push",
+        "description": (
+            "Windows kompyuterdagi repo papkasida barcha o'zgarishlarni commit qilib "
+            "GitHub'ga (yoki boshqa remote'ga) push qiladi. Foydalanuvchi 'o'zgarishlarni "
+            "saqla/push qil/commit qil' desa ishlating."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "commit_message": {"type": "string", "description": "Commit xabari."},
+                "repo_path": {
+                    "type": "string",
+                    "description": "Repo papkasining to'liq manzili (ixtiyoriy — berilmasa, agent joriy ishlab turgan papkasi ishlatiladi).",
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Push qilinadigan branch nomi (ixtiyoriy).",
+                },
+            },
+            "required": ["commit_message"],
+        },
+    },
+    {
+        "name": "github_create_pr",
+        "description": "GitHub'da yangi Pull Request yaratadi (GITHUB_TOKEN va GITHUB_REPO sozlangan bo'lishi kerak).",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "PR sarlavhasi."},
+                "head_branch": {"type": "string", "description": "O'zgarishlar joylashgan branch."},
+                "body": {"type": "string", "description": "PR tavsifi (ixtiyoriy)."},
+                "base_branch": {
+                    "type": "string",
+                    "description": "Qo'shilishi kerak bo'lgan asosiy branch (ixtiyoriy, standart: main).",
+                },
+            },
+            "required": ["title", "head_branch"],
+        },
+    },
+    {
+        "name": "github_list_open_prs",
+        "description": "GitHub repozitoriyasidagi barcha ochiq Pull Request'lar ro'yxatini qaytaradi.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "github_review_pr",
+        "description": (
+            "Berilgan raqamli Pull Request'ning diff (kod o'zgarishlari) matnini GitHub'dan "
+            "olib beradi — shundan so'ng o'zingiz shu diff'ni o'qib, kod review sifatida "
+            "xato, xavfsizlik va uslub bo'yicha fikr-mulohaza yozing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {"pr_number": {"type": "integer", "description": "PR raqami."}},
+            "required": ["pr_number"],
+        },
+    },
+    {
+        "name": "github_post_pr_comment",
+        "description": "Berilgan Pull Request'ga izoh (comment) qoldiradi — masalan kod review natijasini yozish uchun.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "pr_number": {"type": "integer", "description": "PR raqami."},
+                "comment": {"type": "string", "description": "Izoh matni."},
+            },
+            "required": ["pr_number", "comment"],
+        },
+    },
 ]
 
 
@@ -343,6 +796,53 @@ def run_tool(name: str, tool_input: dict) -> str:
         return tool_delete_reminder(int(tool_input.get("id", -1)))
     if name == "notify_progress":
         return tool_notify_progress(tool_input.get("text", ""))
+    if name == "pc_open_app":
+        return tool_pc_open_app(tool_input.get("app_name", ""))
+    if name == "pc_close_app":
+        return tool_pc_close_app(tool_input.get("app_name", ""))
+    if name == "pc_run_command":
+        return tool_pc_run_command(tool_input.get("command", ""))
+    if name == "pc_open_url":
+        return tool_pc_open_url(tool_input.get("url", ""))
+    if name == "pc_power":
+        return tool_pc_power(tool_input.get("action", ""))
+    if name == "pc_status":
+        return tool_pc_status()
+    if name == "pc_list_dir":
+        return tool_pc_list_dir(tool_input.get("path", ""))
+    if name == "git_commit_and_push":
+        return tool_git_commit_and_push(
+            tool_input.get("commit_message", ""),
+            tool_input.get("repo_path", ""),
+            tool_input.get("branch", ""),
+        )
+    if name == "github_create_pr":
+        try:
+            return tool_github_create_pr(
+                tool_input.get("title", ""),
+                tool_input.get("head_branch", ""),
+                tool_input.get("body", ""),
+                tool_input.get("base_branch", ""),
+            )
+        except RuntimeError as e:
+            return str(e)
+    if name == "github_list_open_prs":
+        try:
+            return tool_github_list_open_prs()
+        except RuntimeError as e:
+            return str(e)
+    if name == "github_review_pr":
+        try:
+            return tool_github_review_pr(int(tool_input.get("pr_number", -1)))
+        except RuntimeError as e:
+            return str(e)
+    if name == "github_post_pr_comment":
+        try:
+            return tool_github_post_pr_comment(
+                int(tool_input.get("pr_number", -1)), tool_input.get("comment", "")
+            )
+        except RuntimeError as e:
+            return str(e)
     return f"Noma'lum tool: {name}"
 
 
@@ -366,7 +866,23 @@ def build_system_prompt() -> str:
         "foydalan. Nisbiy vaqtlarni ('ertaga', 'yarim soatdan keyin') hozirgi vaqtga qarab "
         "aniq ISO sanaga aylantirib ber. Agar uzoq davom etadigan vazifa (masalan loyiha "
         "ustida ishlash, kod yozish) haqida gap ketsa va foydalanuvchi keyinroq holatini "
-        "bilishi kerak bo'lsa, notify_progress tool'idan foydalanib bildirishnoma yubor."
+        "bilishi kerak bo'lsa, notify_progress tool'idan foydalanib bildirishnoma yubor. "
+        "Agar foydalanuvchi Windows kompyuterini boshqarishni so'rasa (dastur ochish/yopish, "
+        "terminal buyrug'i, sayt ochish, kompyuterni qulflash/o'chirish/qayta yuklash, "
+        "kompyuter holatini bilish) — mos pc_* tool'laridan foydalan. Agar foydalanuvchi "
+        "kompyuterdagi biror papkada nima borligini so'rasa, pc_list_dir tool'idan "
+        "foydalan. Agar kompyuter javob bermasa (timeout), foydalanuvchiga buni tabiiy "
+        "tilda tushuntir va Windows agent dasturi ishlab turganini tekshirishni "
+        "tavsiya qil. "
+        "Agar foydalanuvchi kod o'zgarishlarini saqlash/push qilishni so'rasa — "
+        "git_commit_and_push tool'idan foydalan (bu Windows agent orqali ishlaydi, "
+        "shuning uchun kompyuter ochiq va repo shu yerda bo'lishi kerak). GitHub'dagi "
+        "Pull Request'lar bilan ishlash uchun (ro'yxatini ko'rish, yangisini ochish, "
+        "diff'ni o'qib review yozish, izoh qoldirish) — github_list_open_prs, "
+        "github_create_pr, github_review_pr va github_post_pr_comment tool'laridan "
+        "foydalan. Agar bu tool'lar 'GitHub sozlanmagan' deb xato qaytarsa, "
+        "foydalanuvchiga serverda GITHUB_TOKEN va GITHUB_REPO muhit o'zgaruvchilarini "
+        "sozlash kerakligini tushuntir."
     )
 
 
@@ -499,22 +1015,41 @@ def call_claude_stream(messages: List[dict]):
                     if event_name == "content_block_start":
                         idx = evt["index"]
                         block = evt["content_block"]
-                        if block.get("type") == "tool_use":
+                        btype = block.get("type")
+                        if btype in ("tool_use", "server_tool_use"):
+                            # "tool_use" — Claude o'zi bajarolmaydigan (pc_*,
+                            # add_reminder va h.k.) buyruqlar; "server_tool_use"
+                            # — Claude'ning o'zi ichki bajaradigan hosted
+                            # vositalar (masalan web_search). Ikkalasi ham
+                            # input_json_delta orqali argumentlarini oqim
+                            # shaklida yuboradi, shuning uchun bir xil tarzda
+                            # yig'amiz.
                             blocks[idx] = {
-                                "type": "tool_use",
+                                "type": btype,
                                 "name": block.get("name"),
                                 "id": block.get("id"),
                                 "json": "",
                             }
-                        else:
+                        elif btype == "text":
                             blocks[idx] = {"type": "text", "text": ""}
+                        else:
+                            # Masalan "web_search_tool_result" — bu blok
+                            # to'liq holda content_block_start'ning o'zida
+                            # keladi (keyin delta kelmaydi), shuning uchun
+                            # o'zgarishsiz saqlab qo'yamiz va oxirida
+                            # bo'lgan-bo'lganicha conversation'ga qaytaramiz.
+                            blocks[idx] = {"type": "passthrough", "raw": block}
 
                     elif event_name == "content_block_delta":
                         idx = evt["index"]
+                        if idx not in blocks:
+                            continue
+                        b = blocks[idx]
                         delta = evt.get("delta", {})
-                        if delta.get("type") == "text_delta":
+                        dtype = delta.get("type")
+                        if dtype == "text_delta" and b["type"] == "text":
                             piece = delta.get("text", "")
-                            blocks[idx]["text"] += piece
+                            b["text"] += piece
                             buffer += piece
                             parts = _SENTENCE_END_RE.split(buffer)
                             if len(parts) > 1:
@@ -523,8 +1058,12 @@ def call_claude_stream(messages: List[dict]):
                                     if sent:
                                         yield sent
                                 buffer = parts[-1]
-                        elif delta.get("type") == "input_json_delta":
-                            blocks[idx]["json"] += delta.get("partial_json", "")
+                        elif dtype == "input_json_delta" and b["type"] in (
+                            "tool_use", "server_tool_use",
+                        ):
+                            b["json"] += delta.get("partial_json", "")
+                        # citations_delta va boshqa turlar — hozircha e'tiborsiz
+                        # qoldiramiz (funksionallikka ta'sir qilmaydi).
 
                     elif event_name == "message_delta":
                         sr = evt.get("delta", {}).get("stop_reason")
@@ -546,17 +1085,26 @@ def call_claude_stream(messages: List[dict]):
             b = blocks[idx]
             if b["type"] == "text":
                 content_blocks.append({"type": "text", "text": b["text"]})
+            elif b["type"] == "passthrough":
+                content_blocks.append(b["raw"])
             else:
                 try:
                     tool_input = json.loads(b["json"]) if b["json"] else {}
                 except json.JSONDecodeError:
                     tool_input = {}
                 content_blocks.append(
-                    {"type": "tool_use", "id": b["id"], "name": b["name"], "input": tool_input}
+                    {"type": b["type"], "id": b["id"], "name": b["name"], "input": tool_input}
                 )
         conversation.append({"role": "assistant", "content": content_blocks})
 
-        if stop_reason == "tool_use":
+        # Faqat "tool_use" (Claude o'zi bajarolmaydigan, biz bajarishimiz
+        # kerak bo'lgan) chaqiruvlarga javob qaytaramiz. "server_tool_use"
+        # (masalan web_search) allaqachon Claude tomonidan bajarilgan va
+        # natijasi (web_search_tool_result) shu javobning ichida keladi —
+        # unga alohida tool_result yubormaymiz.
+        if stop_reason == "tool_use" and any(
+            b.get("type") == "tool_use" for b in content_blocks
+        ):
             tool_results = []
             for b in content_blocks:
                 if b.get("type") == "tool_use":
@@ -789,47 +1337,71 @@ def prepare_text_for_speech(raw: str) -> str:
 async def synthesize_speech(
     text: str, rate_percent: int = 0, pitch_percent: int = 0
 ) -> bytes:
-    """MadinaNeural ovozida MP3 baytlarini generatsiya qiladi.
+    """OpenAI'ning nutq sintezi (audio/speech) API'si orqali MP3 baytlarini
+    generatsiya qiladi.
 
-    pitch_percent: ovoz balandligini o'zgartiradi (-50 dan +50 gacha,
-    edge-tts'ga "+NHz" shaklida yuboriladi). Musbat qiymat ovozni
-    balandroq va yoshroq/shiraliroq eshitiladigan qiladi.
+    rate_percent: -50..+50 oralig'ida, gapirish tezligiga ta'sir qiladi
+    (OpenAI'ning "speed" parametriga 0.5..1.5 oralig'iga moslab
+    aylantiriladi).
+    pitch_percent: OpenAI TTS API'sida alohida "balandlik" parametri yo'q,
+    shuning uchun bu qiymat "instructions" matni ichida ohang tavsifi
+    sifatida beriladi (gpt-4o-mini-tts buni tushunadi).
 
-    Railway/bulutli serverlarda edge-tts vaqti-vaqti bilan
-    "NoAudioReceived" xatosini beradi (Microsoft'ning ichki xizmati
-    ba'zi bulutli IP-manzillarni cheklaydi/bloklaydi). Bu ko'pincha
-    vaqtinchalik bo'ladi, shuning uchun bir necha marta qayta urinamiz.
-    Har bir urinishdagi aniq xatoni ham logga yozamiz — shu orqali
-    muammo IP bloklanishimi yoki boshqa narsa ekanini bilib olamiz.
+    Railway kabi bulutli serverlarda vaqti-vaqti bilan tarmoq xatosi
+    chiqishi mumkin, shuning uchun bir necha marta qayta urinamiz.
     """
-    rate_str = f"{rate_percent:+d}%"
-    # edge-tts pitch qiymatini Hz sifatida kutadi; foizni taxminan Hz'ga
-    # aylantiramiz (har 1% ≈ 2Hz, odatiy ovoz diapazoni uchun yetarli).
-    pitch_str = f"{pitch_percent * 2:+d}Hz"
-    last_error: Exception | None = None
+    if not OPENAI_API_KEY or "BU_YERGA" in OPENAI_API_KEY:
+        raise RuntimeError(
+            "OpenAI API kaliti sozlanmagan. Serverda OPENAI_API_KEY "
+            "muhit o'zgaruvchisini o'rnating."
+        )
 
+    # -50..+50 % ni OpenAI kutadigan 0.5..1.5 tezlik ko'paytiruvchisiga
+    # aylantiramiz (0% -> 1.0x).
+    speed = max(0.5, min(1.5, 1.0 + (rate_percent / 100.0)))
+
+    instructions = VERA_VOICE_STYLE
+    if pitch_percent > 10:
+        instructions += " Ovozing biroz balandroq va yoshroq jarangla."
+    elif pitch_percent < -10:
+        instructions += " Ovozing biroz pastroq va sokinroq jarangla."
+
+    headers = {
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": OPENAI_TTS_MODEL,
+        "voice": VERA_VOICE,
+        "input": text,
+        "response_format": "mp3",
+        "speed": round(speed, 2),
+    }
+    # "instructions" faqat gpt-4o-mini-tts kabi yangi modellarda ishlaydi;
+    # eski tts-1/tts-1-hd buni e'tiborsiz qoldiradi yoki xato qaytarishi
+    # mumkin, shuning uchun faqat yangi model tanlanganda qo'shamiz.
+    if "mini-tts" in OPENAI_TTS_MODEL or "gpt-4o" in OPENAI_TTS_MODEL:
+        payload["instructions"] = instructions
+
+    last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            communicate = edge_tts.Communicate(
-                text, voice=VERA_VOICE, rate=rate_str, pitch=pitch_str
+            resp = requests.post(
+                "https://api.openai.com/v1/audio/speech",
+                headers=headers,
+                json=payload,
+                timeout=60,
             )
-            audio_chunks = bytearray()
-            async for chunk in communicate.stream():
-                if chunk["type"] == "audio":
-                    audio_chunks.extend(chunk["data"])
-            if not audio_chunks:
-                raise RuntimeError("edge-tts bo'sh audio qaytardi (0 bayt)")
+            if resp.status_code != 200:
+                raise RuntimeError(
+                    f"OpenAI TTS xatosi ({resp.status_code}): {resp.text[:300]}"
+                )
+            audio_bytes = resp.content
+            if not audio_bytes:
+                raise RuntimeError("OpenAI TTS bo'sh audio qaytardi (0 bayt)")
             if attempt > 1:
                 print(f"[TTS] {attempt}-urinishda muvaffaqiyatli bo'ldi.")
-            return bytes(audio_chunks)
-        except (UnicodeEncodeError, UnicodeDecodeError) as e:
-            # Matnda kodlanmaydigan belgi bor — qayta urinish foydasiz
-            # (bir xil matn, bir xil xato bo'ladi), shuning uchun darhol
-            # to'xtaymiz. (prepare_text_for_speech endi bunday belgilarni
-            # oldindan tozalaydi, shu sabab bu holat kam uchraydi.)
-            print(f"[TTS XATO] Matnda kodlanmaydigan belgi bor: "
-                  f"{type(e).__name__}: {e}")
-            raise RuntimeError(f"Matnda kodlanmaydigan belgi bor: {e}") from e
+            return audio_bytes
         except Exception as e:
             last_error = e
             print(f"[TTS XATO] {attempt}-urinish muvaffaqiyatsiz: "
@@ -837,9 +1409,8 @@ async def synthesize_speech(
             if attempt < 3:
                 await asyncio.sleep(1.5 * attempt)
 
-    # Uch marta urinib ham bo'lmasa — aniq xato bilan tashqariga chiqaramiz.
     raise RuntimeError(
-        f"edge-tts 3 marta urinishdan keyin ham ishlamadi: "
+        f"OpenAI TTS 3 marta urinishdan keyin ham ishlamadi: "
         f"{type(last_error).__name__}: {last_error}"
     )
 
@@ -1056,6 +1627,56 @@ async def speak(req: SpeakRequest):
     return Response(content=audio_bytes, media_type="audio/mpeg")
 
 
+class TranscribeRequest(BaseModel):
+    audio_base64: str
+    format: str = "m4a"
+
+
+# Ovozni matnga aylantirish uchun OpenAI modeli. "gpt-4o-mini-transcribe"
+# tezroq/arzonroq, "whisper-1" ancha sinovdan o'tgan. O'zbek tili uchun
+# ikkalasi ham ishlaydi, lekin natija sifatini solishtirib ko'ring.
+OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+
+
+@app.post("/transcribe")
+async def transcribe_audio(req: TranscribeRequest):
+    """Telefon/kompyuter ilovasi foydalanuvchi gapini yozib olib, shu yerga
+    yuboradi — biz uni OpenAI'ning nutqni matnga aylantirish (STT) API'siga
+    uzatamiz va tanilgan matnni qaytaramiz."""
+    if not OPENAI_API_KEY or "BU_YERGA" in OPENAI_API_KEY:
+        raise HTTPException(
+            status_code=500,
+            detail="OpenAI API kaliti sozlanmagan. Serverda OPENAI_API_KEY o'rnating.",
+        )
+    try:
+        audio_bytes = base64.b64decode(req.audio_base64)
+    except Exception:
+        raise HTTPException(status_code=400, detail="audio_base64 noto'g'ri formatda.")
+    if not audio_bytes:
+        raise HTTPException(status_code=400, detail="Audio ma'lumoti bo'sh.")
+
+    ext = (req.format or "m4a").lstrip(".")
+    files = {"file": (f"audio.{ext}", audio_bytes, f"audio/{ext}")}
+    data = {"model": OPENAI_STT_MODEL, "language": "uz"}
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files=files,
+            data=data,
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"OpenAI STT so'rovida xato: {e}")
+    if resp.status_code != 200:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenAI STT xatosi ({resp.status_code}): {resp.text[:300]}",
+        )
+    text = (resp.json().get("text") or "").strip()
+    return {"text": text}
+
+
 @app.get("/reminders")
 def list_reminders_endpoint():
     return json.loads(tool_list_reminders()) if tool_list_reminders() != "Hozircha faol eslatma yo'q." else []
@@ -1067,6 +1688,156 @@ def get_pending_notifications():
         items = pending_notifications.copy()
         pending_notifications.clear()
     return {"notifications": items}
+
+
+# ------------------------------------------------------------------
+# 7.5) WINDOWS AGENT bilan aloqa (windows_agent.py shu endpointlarni chaqiradi)
+# ------------------------------------------------------------------
+
+class AgentResultRequest(BaseModel):
+    id: int
+    status: str  # "done" yoki "error"
+    result: str = ""
+
+
+# Har bir agentning oxirgi so'nggi so'rov vaqti (xotirada, oddiy "onlaynmi" belgisi uchun)
+agent_last_seen: dict[str, str] = {}
+
+
+def _check_agent_token(token: str):
+    if not AGENT_TOKEN or "O'ZGARTIRING" in AGENT_TOKEN:
+        raise HTTPException(
+            status_code=500,
+            detail="AGENT_TOKEN sozlanmagan. Serverda AGENT_TOKEN muhit o'zgaruvchisini o'rnating.",
+        )
+    if token != AGENT_TOKEN:
+        raise HTTPException(status_code=401, detail="Noto'g'ri agent token")
+
+
+@app.get("/agent/next_command")
+def agent_next_command(token: str, agent_name: str = DEFAULT_AGENT_NAME):
+    """Windows agent shu endpointni har 1-2 soniyada so'rab turadi. Navbatda
+    bajarilmagan buyruq bo'lsa — uni 'sent' deb belgilab qaytaradi (shu bilan
+    bir buyruq ikki marta bajarilib qolmaydi)."""
+    _check_agent_token(token)
+    agent_last_seen[agent_name] = datetime.datetime.now().isoformat()
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id, action, params FROM pc_commands "
+            f"WHERE status = 'pending' AND agent_name = {PARAM} "
+            f"ORDER BY id ASC LIMIT 1",
+            (agent_name,),
+        )
+        row = cur.fetchone()
+        if row:
+            cur.execute(
+                f"UPDATE pc_commands SET status = 'sent' WHERE id = {PARAM}", (row[0],)
+            )
+            conn.commit()
+        cur.close()
+        conn.close()
+    if not row:
+        return {"command": None}
+    return {"command": {"id": row[0], "action": row[1], "params": json.loads(row[2])}}
+
+
+@app.post("/agent/command_result")
+def agent_command_result(req: AgentResultRequest, token: str):
+    """Windows agent buyruqni bajargach, natijasini shu yerga yuboradi."""
+    _check_agent_token(token)
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"UPDATE pc_commands SET status = {PARAM}, result = {PARAM}, completed_at = {PARAM} "
+            f"WHERE id = {PARAM}",
+            (req.status, req.result, datetime.datetime.now().isoformat(), req.id),
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+    return {"status": "ok"}
+
+
+@app.get("/agent/status")
+def agent_connection_status(agent_name: str = DEFAULT_AGENT_NAME):
+    """Ilova (Flutter) shu orqali 'kompyuter onlaynmi' degan holatni ko'rsatishi
+    mumkin: oxirgi so'rov 15 soniyadan kam oldin bo'lsa — onlayn deymiz."""
+    last_seen = agent_last_seen.get(agent_name)
+    online = False
+    if last_seen:
+        elapsed = (datetime.datetime.now() - datetime.datetime.fromisoformat(last_seen)).total_seconds()
+        online = elapsed < 15
+    return {"last_seen": last_seen, "online": online}
+
+
+@app.get("/agent/history")
+def agent_command_history(limit: int = 30, agent_name: str = DEFAULT_AGENT_NAME):
+    """'Vazifalar markazi' ekrani uchun: Windows agentga yuborilgan so'nggi
+    buyruqlar va ularning natijalari (Flutter shu ro'yxatni jonli log sifatida
+    ko'rsatadi)."""
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id, action, params, status, result, created_at, completed_at "
+            f"FROM pc_commands WHERE agent_name = {PARAM} "
+            f"ORDER BY id DESC LIMIT {PARAM}",
+            (agent_name, limit),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    return {
+        "commands": [
+            {
+                "id": r[0],
+                "action": r[1],
+                "params": r[2],
+                "status": r[3],
+                "result": r[4],
+                "created_at": r[5],
+                "completed_at": r[6],
+            }
+            for r in rows
+        ]
+    }
+
+
+class PcQuickActionRequest(BaseModel):
+    action: str
+    params: dict = {}
+
+
+@app.post("/pc/quick_action")
+def pc_quick_action(req: PcQuickActionRequest):
+    """'Kompyuter' ekranidagi tugmalar (qulflash, ilova ochish va h.k.) shu
+    endpoint orqali to'g'ridan-to'g'ri, Claude'siz ishlaydi — chat tarixiga
+    yozilmaydi, faqat pc_commands jadvaliga tushadi."""
+    if req.action not in {
+        "open_app", "close_app", "run_shell_command", "open_url",
+        "system_power", "get_system_status", "list_dir",
+    }:
+        raise HTTPException(status_code=400, detail=f"Noma'lum amal: {req.action}")
+    result = run_pc_command_and_wait(req.action, req.params)
+    return {"result": result}
+
+
+@app.get("/github/prs")
+def github_prs_endpoint():
+    """'Vazifalar markazi' ekranida ochiq Pull Request'larni ko'rsatish uchun."""
+    try:
+        raw = tool_github_list_open_prs()
+    except RuntimeError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if raw.startswith("Hozircha"):
+        return {"prs": []}
+    try:
+        return {"prs": json.loads(raw)}
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=502, detail=raw)
 
 
 # ------------------------------------------------------------------
