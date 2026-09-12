@@ -145,6 +145,12 @@ DEFAULT_AGENT_NAME = os.environ.get("DEFAULT_AGENT_NAME", "windows-pc")
 # Claude tool orqali buyruq yuborgach, Windows agentdan javob kelishini
 # necha soniya kutishi (agent odatda 1-3 soniyada so'raydi va bajaradi).
 PC_COMMAND_TIMEOUT_SEC = int(os.environ.get("PC_COMMAND_TIMEOUT_SEC", "25"))
+# Windows agent /agent/next_command so'raganda, buyruq hali yo'q bo'lsa,
+# server shuncha soniyagacha "kutib turadi" (long-polling) — shu bilan
+# agent'ning navbatdagi so'rovini kutish shart bo'lmaydi. MUHIM: bu qiymat
+# windows_agent.py'dagi so'rov timeout'idan (25s) kamroq bo'lishi shart,
+# aks holda agent tomonida vaqtidan oldin "timeout" xatosi chiqadi.
+AGENT_LONG_POLL_SEC = float(os.environ.get("AGENT_LONG_POLL_SEC", "18"))
 
 DB_PATH = os.environ.get("VERA_DB", "vera.db")
 HOST = "0.0.0.0"
@@ -430,7 +436,7 @@ def run_pc_command_and_wait(action: str, params: dict, agent_name: str = None) -
             status, result = row
             prefix = "Bajarildi" if status == "done" else "Xatolik"
             return f"{prefix}: {result or '(natija yoq)'}"
-        time.sleep(0.7)
+        time.sleep(0.2)
     return (
         "Kompyuter javob bermadi (timeout). Windows agent dasturi (windows_agent.py) "
         "kompyuteringizda ishlab turganini va internetga ulanganini tekshiring."
@@ -1927,31 +1933,43 @@ def _check_agent_token(token: str):
 
 @app.get("/agent/next_command")
 def agent_next_command(token: str, agent_name: str = DEFAULT_AGENT_NAME):
-    """Windows agent shu endpointni har 1-2 soniyada so'rab turadi. Navbatda
-    bajarilmagan buyruq bo'lsa — uni 'sent' deb belgilab qaytaradi (shu bilan
-    bir buyruq ikki marta bajarilib qolmaydi)."""
+    """Windows agent shu endpointni so'rab turadi. MUHIM: buyruq hali
+    navbatda yo'q bo'lsa, darhol bo'sh javob qaytarish o'rniga bir necha
+    soniya "kutib turamiz" (long-polling) — shu paytda yangi buyruq kelsa,
+    darhol qaytariladi. Shu bilan agent'ning navbatdagi so'rov yuborishini
+    kutish shart bo'lmaydi va ketma-ket buyruqlar orasidagi kechikish
+    sezilarli darajada qisqaradi (avval ~1.5s gacha, endi deyarli 0)."""
     _check_agent_token(token)
     agent_last_seen[agent_name] = datetime.datetime.now().isoformat()
-    with _db_lock:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(
-            f"SELECT id, action, params FROM pc_commands "
-            f"WHERE status = 'pending' AND agent_name = {PARAM} "
-            f"ORDER BY id ASC LIMIT 1",
-            (agent_name,),
-        )
-        row = cur.fetchone()
-        if row:
+
+    def _try_fetch():
+        with _db_lock:
+            conn = get_conn()
+            cur = conn.cursor()
             cur.execute(
-                f"UPDATE pc_commands SET status = 'sent' WHERE id = {PARAM}", (row[0],)
+                f"SELECT id, action, params FROM pc_commands "
+                f"WHERE status = 'pending' AND agent_name = {PARAM} "
+                f"ORDER BY id ASC LIMIT 1",
+                (agent_name,),
             )
-            conn.commit()
-        cur.close()
-        conn.close()
-    if not row:
-        return {"command": None}
-    return {"command": {"id": row[0], "action": row[1], "params": json.loads(row[2])}}
+            row = cur.fetchone()
+            if row:
+                cur.execute(
+                    f"UPDATE pc_commands SET status = 'sent' WHERE id = {PARAM}", (row[0],)
+                )
+                conn.commit()
+            cur.close()
+            conn.close()
+        return row
+
+    deadline = time.time() + AGENT_LONG_POLL_SEC
+    while True:
+        row = _try_fetch()
+        if row:
+            return {"command": {"id": row[0], "action": row[1], "params": json.loads(row[2])}}
+        if time.time() >= deadline:
+            return {"command": None}
+        time.sleep(0.2)
 
 
 @app.post("/agent/command_result")
