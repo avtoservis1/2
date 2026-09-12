@@ -232,6 +232,35 @@ def init_db():
                     completed_at TEXT
                 )"""
             )
+            # --- "MIYYA" (xotira) jadvallari -----------------------------
+            # memory_events — epizodik xotira: skaner yoki suhbatdan kelgan
+            # XOM ma'lumot, hali "fakt"ga aylantirilmagan holatda.
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS memory_events(
+                    id SERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    project TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    processed INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            # memory_facts — semantik xotira: distillangan, qidirish uchun
+            # embedding bilan saqlangan alohida faktlar.
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS memory_facts(
+                    id SERIAL PRIMARY KEY,
+                    category TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    project TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    importance INTEGER DEFAULT 1,
+                    embedding TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )"""
+            )
         else:
             cur.execute(
                 """CREATE TABLE IF NOT EXISTS messages(
@@ -271,6 +300,30 @@ def init_db():
                     result TEXT,
                     created_at TEXT NOT NULL,
                     completed_at TEXT
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS memory_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_type TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    project TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    processed INTEGER DEFAULT 0,
+                    created_at TEXT NOT NULL
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS memory_facts(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    category TEXT NOT NULL,
+                    content TEXT NOT NULL,
+                    project TEXT DEFAULT '',
+                    source TEXT DEFAULT '',
+                    importance INTEGER DEFAULT 1,
+                    embedding TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
                 )"""
             )
         conn.commit()
@@ -510,6 +563,18 @@ def tool_pc_key_press(keys: str) -> str:
 
 def tool_pc_type_text(text: str) -> str:
     return run_pc_command_and_wait("type_text", {"text": text})
+
+
+def tool_pc_scan_computer() -> str:
+    """Skaner butun fayl tizimini aylanib chiqishi mumkin bo'lgani uchun
+    (bir necha o'n soniya cho'zilishi mumkin) natijani KUTMASDAN buyruqni
+    navbatga qo'yamiz — Windows agent uni bajarib, natijalarni to'g'ridan-
+    to'g'ri /memory/event orqali miyyaga yozadi."""
+    enqueue_pc_command("scan_computer", {})
+    return (
+        "Kompyuterni skanerlashni boshladim, bu bir necha daqiqa vaqt olishi "
+        "mumkin. Topilgan loyihalar avtomatik ravishda miyyaga yoziladi."
+    )
 
 
 # ------------------------------------------------------------------
@@ -863,6 +928,16 @@ TOOLS_SCHEMA = [
         },
     },
     {
+        "name": "pc_scan_computer",
+        "description": (
+            "Windows kompyuterdagi loyiha papkalarini (Flutter, Python, Node.js va h.k.) "
+            "qidirib topib, ularni 'miyya' (uzoq muddatli xotira) ga yozadi. Foydalanuvchi "
+            "'kompyuterimni skanerla/o'rgan', 'loyihalarimni bilib ol' desa ishlating. "
+            "Natija darhol emas, fon jarayonida ishlanadi."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "git_commit_and_push",
         "description": (
             "Windows kompyuterdagi repo papkasida barcha o'zgarishlarni commit qilib "
@@ -930,6 +1005,42 @@ TOOLS_SCHEMA = [
                 "comment": {"type": "string", "description": "Izoh matni."},
             },
             "required": ["pr_number", "comment"],
+        },
+    },
+    {
+        "name": "memory_remember",
+        "description": (
+            "Foydalanuvchi haqida uzoq muddat eslab qolish kerak bo'lgan bitta faktni "
+            "darhol xotiraga ('miyya'ga) yozadi — masalan foydalanuvchi 'buni yodda tut' "
+            "desa, yoki muhim shaxsiy tafsilot/qaror/afzallik aytsa."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Saqlanadigan fakt, bitta qisqa gap."},
+                "category": {
+                    "type": "string",
+                    "description": "Fakt turi: loyiha, texnologiya, odat, tizim yoki boshqa.",
+                },
+                "project": {"type": "string", "description": "Tegishli loyiha nomi (ixtiyoriy)."},
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "memory_search",
+        "description": (
+            "Xotiradan ('miyya'dan) foydalanuvchi yoki uning loyihalari haqida "
+            "saqlangan faktlarni qidirib topadi. Foydalanuvchi 'men haqimda nima "
+            "bilasan', 'qaysi loyihalarim bor' kabi savol bersa ishlating."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Qidiruv so'rovi."},
+                "project": {"type": "string", "description": "Faqat shu loyiha bo'yicha qidirish (ixtiyoriy)."},
+            },
+            "required": ["query"],
         },
     },
 ]
@@ -1025,7 +1136,319 @@ def run_tool(name: str, tool_input: dict) -> str:
             )
         except RuntimeError as e:
             return str(e)
+    if name == "pc_scan_computer":
+        return tool_pc_scan_computer()
+    if name == "memory_remember":
+        return tool_memory_remember(
+            tool_input.get("content", ""),
+            tool_input.get("category", "boshqa"),
+            tool_input.get("project", ""),
+        )
+    if name == "memory_search":
+        return tool_memory_search(tool_input.get("query", ""), tool_input.get("project", ""))
     return f"Noma'lum tool: {name}"
+
+
+# ------------------------------------------------------------------
+# 3.7) "MIYYA" — XOTIRA TIZIMI (episodik + semantik + protsedura)
+# ------------------------------------------------------------------
+#
+# Arxitektura (CoALA/AI agent memory taksonomiyasiga asoslangan):
+#   1) memory_events (EPIZODIK) — skaner yoki suhbatdan kelgan XOM
+#      ma'lumot. Hech narsa filtrlanmagan, faqat "nima bo'ldi" yozib
+#      boriladi.
+#   2) consolidate_memory_events() (DISTILLASH) — fon jarayonida
+#      ishlaydigan funksiya, xom epizodlarni Claude orqali qisqa,
+#      alohida "fakt"larga aylantiradi (masalan: "C:\Projects\vera —
+#      Flutter+FastAPI loyihasi").
+#   3) memory_facts (SEMANTIK) — distillangan faktlar, har biri OpenAI
+#      embedding vektori bilan birga saqlanadi — bu qidirish (RAG) uchun
+#      kerak.
+#   4) search_memory() (QIDIRUV/RETRIEVAL) — savol kelganda faqat eng
+#      tegishli 3-5 ta faktni topib, Claude'ning system promptiga
+#      qo'shadi — bu esa "protsedura xotira" qatlami: Claude har doim
+#      shu faktlarni hisobga olib javob berish "qoidasi"ga amal qiladi.
+#
+# Vector bazasi (Pinecone va h.k.) shart emas — shaxsiy foydalanish
+# hajmida oddiy cosine-similarity Python'da yetarlicha tez ishlaydi.
+
+OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
+OPENAI_EMBEDDINGS_URL = "https://api.openai.com/v1/embeddings"
+# Bitta consolidation aylanasida qayta ishlanadigan epizod soni — juda
+# ko'p bo'lsa Claude'ga yuboriladigan matn haddan tashqari uzun bo'lib
+# ketmasligi uchun cheklaymiz.
+MEMORY_CONSOLIDATE_BATCH = 40
+
+
+def get_embedding(text: str):
+    """Matnni OpenAI embedding vektoriga aylantiradi. Kalit sozlanmagan
+    yoki xato bo'lsa, None qaytaradi — chaqiruvchi shu holatni hisobga
+    olishi kerak (masalan, fakt embeddingsiz ham saqlanaveradi, faqat
+    keyinchalik qidiruvda topilmaydi)."""
+    if not OPENAI_API_KEY or "BU_YERGA" in OPENAI_API_KEY:
+        return None
+    text = (text or "").strip()
+    if not text:
+        return None
+    try:
+        resp = requests.post(
+            OPENAI_EMBEDDINGS_URL,
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            json={"model": OPENAI_EMBEDDING_MODEL, "input": text[:8000]},
+            timeout=20,
+        )
+        if resp.status_code != 200:
+            print(f"[MIYYA] Embedding xatosi ({resp.status_code}): {resp.text[:200]}")
+            return None
+        return resp.json()["data"][0]["embedding"]
+    except Exception as e:
+        print(f"[MIYYA] Embedding so'rovida xato: {e}")
+        return None
+
+
+def _cosine_similarity(a, b) -> float:
+    if not a or not b or len(a) != len(b):
+        return 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def save_memory_event(event_type: str, content: str, project: str = "", source: str = "") -> int:
+    """EPIZODIK yozuv — skaner natijasi yoki suhbatdagi muhim voqea. Hali
+    "fakt" emas, keyinroq consolidate_memory_events() orqali qayta ishlanadi."""
+    now_iso = datetime.datetime.now().isoformat()
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"INSERT INTO memory_events(event_type, content, project, source, created_at) "
+            f"VALUES ({PARAM}, {PARAM}, {PARAM}, {PARAM}, {PARAM})"
+            + (" RETURNING id" if USE_POSTGRES else ""),
+            (event_type, content, project, source, now_iso),
+        )
+        new_id = cur.fetchone()[0] if USE_POSTGRES else cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+    return new_id
+
+
+def save_memory_fact(category: str, content: str, project: str = "", source: str = "", importance: int = 1) -> int:
+    """SEMANTIK yozuv — allaqachon qisqa/distillangan bitta fakt.
+    Embedding shu yerda hisoblanadi va birga saqlanadi."""
+    now_iso = datetime.datetime.now().isoformat()
+    embedding = get_embedding(f"{category}: {content}")
+    embedding_json = json.dumps(embedding) if embedding else None
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"INSERT INTO memory_facts(category, content, project, source, importance, embedding, created_at, updated_at) "
+            f"VALUES ({PARAM}, {PARAM}, {PARAM}, {PARAM}, {PARAM}, {PARAM}, {PARAM}, {PARAM})"
+            + (" RETURNING id" if USE_POSTGRES else ""),
+            (category, content, project, source, importance, embedding_json, now_iso, now_iso),
+        )
+        new_id = cur.fetchone()[0] if USE_POSTGRES else cur.lastrowid
+        conn.commit()
+        cur.close()
+        conn.close()
+    return new_id
+
+
+def list_memory_facts(project: str = "", limit: int = 200):
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if project:
+            cur.execute(
+                f"SELECT id, category, content, project, source, importance, created_at "
+                f"FROM memory_facts WHERE project = {PARAM} ORDER BY id DESC LIMIT {PARAM}",
+                (project, limit),
+            )
+        else:
+            cur.execute(
+                f"SELECT id, category, content, project, source, importance, created_at "
+                f"FROM memory_facts ORDER BY id DESC LIMIT {PARAM}",
+                (limit,),
+            )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    return [
+        {
+            "id": r[0], "category": r[1], "content": r[2], "project": r[3],
+            "source": r[4], "importance": r[5], "created_at": r[6],
+        }
+        for r in rows
+    ]
+
+
+def delete_memory_fact(fact_id: int) -> bool:
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(f"DELETE FROM memory_facts WHERE id = {PARAM}", (fact_id,))
+        deleted = cur.rowcount > 0
+        conn.commit()
+        cur.close()
+        conn.close()
+    return deleted
+
+
+def search_memory(query: str, project: str = "", top_k: int = 5, min_score: float = 0.2):
+    """QIDIRUV/RETRIEVAL — savolga eng mos keladigan faktlarni cosine-
+    similarity bo'yicha topadi. Embeddingi bo'lmagan (masalan OpenAI
+    kaliti hozircha sozlanmagan paytda yozilgan) faktlar e'tiborga
+    olinmaydi."""
+    query_embedding = get_embedding(query)
+    if not query_embedding:
+        return []
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if project:
+            cur.execute(
+                f"SELECT id, category, content, project, importance, embedding "
+                f"FROM memory_facts WHERE project = {PARAM} AND embedding IS NOT NULL",
+                (project,),
+            )
+        else:
+            cur.execute(
+                "SELECT id, category, content, project, importance, embedding "
+                "FROM memory_facts WHERE embedding IS NOT NULL"
+            )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+
+    scored = []
+    for r in rows:
+        try:
+            fact_embedding = json.loads(r[5])
+        except Exception:
+            continue
+        score = _cosine_similarity(query_embedding, fact_embedding)
+        if score >= min_score:
+            scored.append({
+                "id": r[0], "category": r[1], "content": r[2],
+                "project": r[3], "importance": r[4], "score": round(score, 3),
+            })
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return scored[:top_k]
+
+
+def consolidate_memory_events() -> str:
+    """DISTILLASH — hali qayta ishlanmagan epizodik yozuvlarni Claude
+    orqali qisqa faktlarga aylantiradi va memory_facts'ga yozadi. Fon
+    jarayoni (memory_consolidation_loop) tomonidan davriy chaqiriladi,
+    shuningdek /memory/consolidate orqali qo'lda ham chaqirish mumkin."""
+    if not ANTHROPIC_API_KEY or "BU_YERGA" in ANTHROPIC_API_KEY:
+        return "Claude API kaliti sozlanmagan, distillash o'tkazib yuborildi."
+
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT id, event_type, content, project, source FROM memory_events "
+            f"WHERE processed = 0 ORDER BY id ASC LIMIT {PARAM}",
+            (MEMORY_CONSOLIDATE_BATCH,),
+        )
+        events = cur.fetchall()
+        cur.close()
+        conn.close()
+
+    if not events:
+        return "Yangi epizod yo'q."
+
+    raw_text = "\n".join(
+        f"[{e[1]}] (loyiha: {e[3] or 'nomalum'}, manba: {e[4]}) {e[2][:500]}"
+        for e in events
+    )
+    prompt = (
+        "Quyida foydalanuvchi kompyuteridan yig'ilgan xom kuzatuvlar "
+        "ro'yxati berilgan. Shu yozuvlardan foydalanuvchi haqida uzoq "
+        "muddat eslab qolish arziydigan, QISQA va ANIQ faktlarni ajratib "
+        "chiqar. Har bir fakt bitta gap bo'lsin. Takrorlanadigan yoki "
+        "ahamiyatsiz narsalarni (masalan vaqtinchalik holat) tashla. "
+        "FAQAT quyidagi JSON formatida javob ber, boshqa hech narsa yozma:\n"
+        '[{"category": "loyiha|texnologiya|odat|tizim|boshqa", '
+        '"content": "fakt matni", "project": "loyiha nomi yoki bo\'sh", '
+        '"importance": 1-5}]\n\n'
+        f"Xom kuzatuvlar:\n{raw_text}"
+    )
+    try:
+        resp = requests.post(
+            CLAUDE_API_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 2048,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        text = "".join(
+            b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"
+        ).strip()
+        text = re.sub(r"^```(json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
+        facts = json.loads(text)
+    except Exception as e:
+        print(f"[MIYYA] Distillashda xato: {e}")
+        return f"Distillashda xato: {e}"
+
+    saved = 0
+    for f in facts:
+        content = (f.get("content") or "").strip()
+        if not content:
+            continue
+        save_memory_fact(
+            category=f.get("category", "boshqa"),
+            content=content,
+            project=f.get("project", "") or "",
+            source="consolidation",
+            importance=int(f.get("importance", 1) or 1),
+        )
+        saved += 1
+
+    event_ids = [e[0] for e in events]
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        placeholders = ",".join([PARAM] * len(event_ids))
+        cur.execute(f"UPDATE memory_events SET processed = 1 WHERE id IN ({placeholders})", event_ids)
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    return f"{len(events)} ta epizod qayta ishlandi, {saved} ta yangi fakt saqlandi."
+
+
+def tool_memory_remember(content: str, category: str = "boshqa", project: str = "") -> str:
+    """Claude tool sifatida — suhbat davomida foydalanuvchi aytgan muhim
+    narsani ('buni yodda tut', shaxsiy tafsilot, qaror va h.k.) darhol,
+    consolidation kutmasdan, to'g'ridan-to'g'ri semantik xotiraga yozadi."""
+    if not content.strip():
+        return "Saqlash uchun matn berilmadi."
+    save_memory_fact(category=category, content=content.strip(), project=project, source="chat_explicit", importance=3)
+    return "Yodda saqlab qo'ydim."
+
+
+def tool_memory_search(query: str, project: str = "") -> str:
+    """Claude tool sifatida — foydalanuvchi aniq so'rasa ('nimalarni bilasan
+    men haqimda', 'qaysi loyihalarim bor'), xotiradan qidirib topib beradi."""
+    results = search_memory(query, project=project, top_k=8, min_score=0.15)
+    if not results:
+        return "Bu haqda xotirada hech narsa topilmadi."
+    return "\n".join(f"- ({r['category']}) {r['content']}" for r in results)
 
 
 # ------------------------------------------------------------------
@@ -1035,8 +1458,25 @@ def run_tool(name: str, tool_input: dict) -> str:
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
 
 
-def build_system_prompt() -> str:
+def build_system_prompt(user_text: str = "") -> str:
     now = datetime.datetime.now().isoformat(timespec="seconds")
+
+    memory_section = ""
+    if user_text.strip():
+        try:
+            facts = search_memory(user_text, top_k=5, min_score=0.25)
+        except Exception as e:
+            print(f"[MIYYA] system promptga qidirishda xato: {e}")
+            facts = []
+        if facts:
+            facts_text = "\n".join(f"- ({f['category']}) {f['content']}" for f in facts)
+            memory_section = (
+                "\n\nMIYYANGDA foydalanuvchi haqida quyidagi tegishli faktlar bor "
+                "(bular avval kompyuterdan yig'ilgan yoki suhbatda aytilgan — "
+                "javob berishda hisobga ol, lekin so'zma-so'z o'qib bermay, "
+                "tabiiy ravishda foydalan):\n" + facts_text
+            )
+
     return (
         "Sen Vera ismli, foydalanuvchiga shaxsan xizmat qiladigan, ayol ovozida gapiradigan "
         "sun'iy intellekt yordamchisisan. Har doim o'zbek tilida, tabiiy, samimiy va "
@@ -1064,11 +1504,18 @@ def build_system_prompt() -> str:
         "github_create_pr, github_review_pr va github_post_pr_comment tool'laridan "
         "foydalan. Agar bu tool'lar 'GitHub sozlanmagan' deb xato qaytarsa, "
         "foydalanuvchiga serverda GITHUB_TOKEN va GITHUB_REPO muhit o'zgaruvchilarini "
-        "sozlash kerakligini tushuntir."
+        "sozlash kerakligini tushuntir. "
+        "Agar foydalanuvchi shaxsan o'zi haqida ('meni yodda tut', 'buni saqla', "
+        "muhim qaror yoki afzallik) biror narsani aytsa — memory_remember tool'idan "
+        "foydalanib darhol xotiraga yoz. Agar foydalanuvchi o'zi yoki loyihalari "
+        "haqida ('men haqimda nima bilasan', 'qaysi loyihalarim bor') so'rasa — "
+        "memory_search tool'idan foydalan. Agar foydalanuvchi kompyuterini "
+        "skanerlashni/o'rganishni so'rasa — pc_scan_computer tool'idan foydalan."
+        + memory_section
     )
 
 
-def call_claude(messages: List[dict]) -> str:
+def call_claude(messages: List[dict], user_text: str = "") -> str:
     if not ANTHROPIC_API_KEY or "BU_YERGA" in ANTHROPIC_API_KEY:
         return (
             "Claude API kaliti sozlanmagan. vera_backend.py faylidagi "
@@ -1082,12 +1529,13 @@ def call_claude(messages: List[dict]) -> str:
     }
 
     conversation = list(messages)
+    system_prompt = build_system_prompt(user_text)
 
     for _ in range(5):  # tool-chaqiruv aylanalari uchun limit
         payload = {
             "model": CLAUDE_MODEL,
             "max_tokens": 1024,
-            "system": build_system_prompt(),
+            "system": system_prompt,
             "messages": conversation,
             "tools": TOOLS_SCHEMA,
         }
@@ -1133,7 +1581,7 @@ def call_claude(messages: List[dict]) -> str:
 _SENTENCE_END_RE = re.compile(r"(?<=[.!?\u2026])\s+")
 
 
-def call_claude_stream(messages: List[dict]):
+def call_claude_stream(messages: List[dict], user_text: str = ""):
     """call_claude bilan bir xil ishlaydi (tool-chaqiruvlarni ham qo'llab-
     quvvatlaydi), lekin natijani bitta katta matn sifatida emas, balki
     tayyor bo'lgan GAPLAR (jumlalar) oqimi sifatida generator orqali
@@ -1152,12 +1600,13 @@ def call_claude_stream(messages: List[dict]):
         "content-type": "application/json",
     }
     conversation = list(messages)
+    system_prompt = build_system_prompt(user_text)
 
     for _ in range(5):  # tool-chaqiruv aylanalari uchun limit
         payload = {
             "model": CLAUDE_MODEL,
             "max_tokens": 1024,
-            "system": build_system_prompt(),
+            "system": system_prompt,
             "messages": conversation,
             "tools": TOOLS_SCHEMA,
             "stream": True,
@@ -1309,7 +1758,7 @@ def call_claude_stream(messages: List[dict]):
 def process_user_message(user_text: str, channel: str) -> str:
     save_message("user", user_text, channel)
     history = get_recent_history(limit=16)
-    reply = call_claude(history)
+    reply = call_claude(history, user_text=user_text)
     save_message("assistant", reply, channel)
     return reply
 
@@ -1349,7 +1798,7 @@ def process_user_image(image_b64: str, media_type: str, caption: str, channel: s
             ],
         }
     )
-    reply = call_claude(history)
+    reply = call_claude(history, user_text=caption)
     save_message("assistant", reply, channel)
     return reply
 
@@ -1432,6 +1881,24 @@ def reminder_checker_loop():
         except Exception as e:
             print("reminder_checker_loop xato:", e)
         time.sleep(15)
+
+
+MEMORY_CONSOLIDATE_INTERVAL_SEC = int(os.environ.get("MEMORY_CONSOLIDATE_INTERVAL_SEC", "1800"))
+
+
+def memory_consolidation_loop():
+    """Fonda ishlaydi: har MEMORY_CONSOLIDATE_INTERVAL_SEC soniyada (standart
+    30 daqiqa) qayta ishlanmagan epizodlarni tekshirib, bo'lsa distillaydi.
+    Shu tufayli skaner yig'gan xom ma'lumot avtomatik ravishda "faktlar"ga
+    aylanib boradi — qo'lda /memory/consolidate chaqirish shart emas."""
+    while True:
+        try:
+            result = consolidate_memory_events()
+            if result != "Yangi epizod yo'q.":
+                print(f"[MIYYA] {result}")
+        except Exception as e:
+            print("memory_consolidation_loop xato:", e)
+        time.sleep(MEMORY_CONSOLIDATE_INTERVAL_SEC)
 
 
 # ------------------------------------------------------------------
@@ -1717,6 +2184,58 @@ def chat(req: ChatRequest):
     return {"reply": reply}
 
 
+# ------------------------------------------------------------------
+# "MIYYA" (xotira) endpointlari
+# ------------------------------------------------------------------
+
+class MemoryEventRequest(BaseModel):
+    event_type: str
+    content: str
+    project: str = ""
+    source: str = ""
+
+
+@app.post("/memory/event")
+def memory_event(req: MemoryEventRequest, token: str):
+    """Windows agent (kompyuter skaneri) yoki boshqa manba shu yerga xom
+    kuzatuv (epizod) yuboradi. AGENT_TOKEN bilan himoyalangan — chunki bu
+    orqali kompyuteringiz haqidagi ma'lumot yuboriladi."""
+    _check_agent_token(token)
+    if not req.content.strip():
+        raise HTTPException(status_code=400, detail="content bo'sh bo'lishi mumkin emas.")
+    new_id = save_memory_event(req.event_type, req.content, req.project, req.source)
+    return {"status": "ok", "id": new_id}
+
+
+@app.post("/memory/consolidate")
+def memory_consolidate(token: str):
+    """Xom epizodlarni qo'lda distillashni ishga tushiradi (odatda buni
+    fon jarayoni — memory_consolidation_loop — avtomatik qiladi)."""
+    _check_agent_token(token)
+    result = consolidate_memory_events()
+    return {"status": "ok", "detail": result}
+
+
+@app.get("/memory/search")
+def memory_search_endpoint(q: str, project: str = "", limit: int = 5):
+    return {"facts": search_memory(q, project=project, top_k=limit)}
+
+
+@app.get("/memory/list")
+def memory_list_endpoint(project: str = "", limit: int = 200):
+    """'Miyya' ekrani shu endpointdan saqlangan barcha faktlarni oladi."""
+    return {"facts": list_memory_facts(project=project, limit=limit)}
+
+
+@app.delete("/memory/{fact_id}")
+def memory_delete_endpoint(fact_id: int):
+    """Foydalanuvchi 'Miyya' ekranidan bitta faktni o'chirishi uchun."""
+    deleted = delete_memory_fact(fact_id)
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Fakt topilmadi.")
+    return {"status": "ok"}
+
+
 @app.post("/chat_stream")
 def chat_stream(req: ChatRequest):
     """/chat bilan bir xil ishlaydi, lekin javobni bitta butun matn
@@ -1731,7 +2250,7 @@ def chat_stream(req: ChatRequest):
     def event_gen():
         full_parts: list[str] = []
         try:
-            for sentence in call_claude_stream(history):
+            for sentence in call_claude_stream(history, user_text=req.message):
                 full_parts.append(sentence)
                 payload = json.dumps({"sentence": sentence}, ensure_ascii=False)
                 yield f"data: {payload}\n\n"
@@ -1861,28 +2380,40 @@ async def transcribe_audio(req: TranscribeRequest):
 
     ext = (req.format or "m4a").lstrip(".")
     files = {"file": (f"audio.{ext}", audio_bytes, f"audio/{ext}")}
-    data = {"model": OPENAI_STT_MODEL}
-    # Faqat whisper-1 "language" parametrini ISO-639-1 kod ("uz") sifatida
-    # to'g'ri qabul qiladi. gpt-4o-* transkripsiya modellari buni rad etadi
-    # (400 xato) — shuning uchun ular uchun tilni "prompt" ichida so'z
-    # bilan ko'rsatamiz, bu ham tanishni o'zbek tiliga yo'naltiradi.
-    if OPENAI_STT_MODEL.startswith("whisper"):
-        data["language"] = "uz"
-    else:
-        data["prompt"] = "Bu audio o'zbek tilida (Uzbek language) so'zlashuv."
+    uz_prompt = "Bu audio o'zbek tilida (Uzbek language) so'zlashuv."
+
+    # MUHIM: ilgari "whisper-1" uchun "language": "uz" ISO kodi yuborilgan
+    # edi, chunki o'sha paytda OpenAI buni to'g'ri qabul qilardi. Endi OpenAI
+    # "language" parametrini qattiqroq tekshiryapti va "uz" kodini rad
+    # etyapti — { "code": "unsupported_language" } — bu istalgan modelda
+    # (whisper-1 bo'lsa ham) sodir bo'lishi mumkin. Shu sabab "language"
+    # parametrini umuman yubormaymiz, tilni faqat "prompt" ichida so'z
+    # bilan ko'rsatamiz — bu hech qachon 400 xatoga sabab bo'lmaydi.
+    data = {"model": OPENAI_STT_MODEL, "prompt": uz_prompt}
+
+    async def call_openai_stt(request_data: dict):
+        return await asyncio.to_thread(
+            requests.post,
+            "https://api.openai.com/v1/audio/transcriptions",
+            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
+            files=files,
+            data=request_data,
+            timeout=30,
+        )
+
     try:
         # Bu ham bloklovchi chaqiruv edi — event loop'ni butun so'rov
         # davomida (audio yuklash + Whisper qayta ishlash, ba'zan bir
         # necha soniya) ushlab turardi, shu paytda server boshqa hech
         # qanday so'rovni (hatto /health'ni ham) qabul qila olmasdi.
-        resp = await asyncio.to_thread(
-            requests.post,
-            "https://api.openai.com/v1/audio/transcriptions",
-            headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
-            files=files,
-            data=data,
-            timeout=30,
-        )
+        resp = await call_openai_stt(data)
+        # Qo'shimcha himoya: agar OpenAI baribir "unsupported_language" yoki
+        # shunga o'xshash 400 xato qaytarsa (masalan OPENAI_STT_MODEL
+        # eskirgan qiymatga o'rnatilgan bo'lsa), "prompt"siz, sof holatda
+        # bitta marta qayta urinib ko'ramiz — foydalanuvchiga "hech narsa
+        # eshitmadim" ko'rinishidagi xato chiqmasin.
+        if resp.status_code == 400 and "unsupported_language" in resp.text:
+            resp = await call_openai_stt({"model": OPENAI_STT_MODEL})
     except requests.RequestException as e:
         raise HTTPException(status_code=502, detail=f"OpenAI STT so'rovida xato: {e}")
     if resp.status_code != 200:
@@ -2054,6 +2585,15 @@ def pc_quick_action(req: PcQuickActionRequest):
     return {"result": result}
 
 
+@app.post("/pc/scan_now")
+def pc_scan_now():
+    """'Miyya' ekranidagi 'Kompyuterni skanerla' tugmasi shu orqali ishlaydi.
+    Skaner uzoq davom etishi mumkinligi uchun natijani KUTMAYDI — buyruqni
+    navbatga qo'yib, darhol qaytadi."""
+    enqueue_pc_command("scan_computer", {})
+    return {"status": "ok", "detail": "Skanerlash boshlandi."}
+
+
 @app.get("/github/prs")
 def github_prs_endpoint():
     """'Vazifalar markazi' ekranida ochiq Pull Request'larni ko'rsatish uchun."""
@@ -2077,6 +2617,7 @@ if __name__ == "__main__":
     init_db()
     threading.Thread(target=reminder_checker_loop, daemon=True).start()
     threading.Thread(target=telegram_loop, daemon=True).start()
+    threading.Thread(target=memory_consolidation_loop, daemon=True).start()
     print(f"Vera backend ishga tushdi: http://{HOST}:{PORT}")
     print("Ogohlantirish: maxfiy kalit tekshiruvi o'chirilgan — bu manzilni "
           "hech kimga bermang, aks holda har kim Vera bilan gaplasha oladi.")
