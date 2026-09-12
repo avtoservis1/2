@@ -1562,7 +1562,14 @@ async def synthesize_speech(
     last_error: Exception | None = None
     for attempt in range(1, 4):
         try:
-            resp = requests.post(
+            # MUHIM: requests.post() bloklovchi (sinxron) chaqiruv. Buni
+            # asyncio.to_thread() bilan alohida oqimga chiqarmasak, u
+            # butun event loop'ni ushlab turadi — shu paytda boshqa hech
+            # qanday so'rov (jumladan PARALEL kelayotgan keyingi gaplar
+            # uchun /speak so'rovlari!) qayta ishlanmaydi. Aynan shu
+            # narsa Vera'ni sezilarli darajada sekinlashtirgan edi.
+            resp = await asyncio.to_thread(
+                requests.post,
                 "https://api.openai.com/v1/audio/speech",
                 headers=headers,
                 json=payload,
@@ -1805,7 +1812,11 @@ async def speak(req: SpeakRequest):
         # Gaplar orasidagi uzun pauzalarni qisqartiramiz. Yangi versiya
         # CROSSFADE emas, faqat FADE ishlatadi (yuqoridagi izohga qarang),
         # shuning uchun endi talaffuzni buzmasdan xavfsiz qo'llash mumkin.
-        audio_bytes = tighten_pauses(audio_bytes)
+        # tighten_pauses() ffmpeg subprocess chaqiradi va CPU'ni band
+        # qiladi — shuni ham alohida oqimga chiqaramiz, aks holda bu ham
+        # event loop'ni bloklab, boshqa PARALEL /speak so'rovlarini
+        # kutdirib qo'yadi.
+        audio_bytes = await asyncio.to_thread(tighten_pauses, audio_bytes)
     except Exception as e:
         print(f"[SPEAK ENDPOINT XATO] {type(e).__name__}: {e}")
         raise HTTPException(status_code=502, detail=f"Ovoz xizmati xatosi: {e}")
@@ -1817,10 +1828,12 @@ class TranscribeRequest(BaseModel):
     format: str = "m4a"
 
 
-# Ovozni matnga aylantirish uchun OpenAI modeli. "gpt-4o-mini-transcribe"
-# tezroq/arzonroq, "whisper-1" ancha sinovdan o'tgan. O'zbek tili uchun
-# ikkalasi ham ishlaydi, lekin natija sifatini solishtirib ko'ring.
-OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe")
+# Ovozni matnga aylantirish uchun OpenAI modeli. MUHIM: "gpt-4o-mini-transcribe"
+# "language": "uz" parametrini tan olmaydi va 400 xato bilan qaytaradi
+# ("Language code 'uz' is not recognized") — aynan shu Vera'ni "hech narsa
+# eshitmayapti"dek qilib qo'ygan edi. "whisper-1" esa o'zbek tilini
+# to'liq qo'llab-quvvatlaydi, shuning uchun standart qilib shuni qo'ydik.
+OPENAI_STT_MODEL = os.environ.get("OPENAI_STT_MODEL", "whisper-1")
 
 
 @app.post("/transcribe")
@@ -1842,9 +1855,22 @@ async def transcribe_audio(req: TranscribeRequest):
 
     ext = (req.format or "m4a").lstrip(".")
     files = {"file": (f"audio.{ext}", audio_bytes, f"audio/{ext}")}
-    data = {"model": OPENAI_STT_MODEL, "language": "uz"}
+    data = {"model": OPENAI_STT_MODEL}
+    # Faqat whisper-1 "language" parametrini ISO-639-1 kod ("uz") sifatida
+    # to'g'ri qabul qiladi. gpt-4o-* transkripsiya modellari buni rad etadi
+    # (400 xato) — shuning uchun ular uchun tilni "prompt" ichida so'z
+    # bilan ko'rsatamiz, bu ham tanishni o'zbek tiliga yo'naltiradi.
+    if OPENAI_STT_MODEL.startswith("whisper"):
+        data["language"] = "uz"
+    else:
+        data["prompt"] = "Bu audio o'zbek tilida (Uzbek language) so'zlashuv."
     try:
-        resp = requests.post(
+        # Bu ham bloklovchi chaqiruv edi — event loop'ni butun so'rov
+        # davomida (audio yuklash + Whisper qayta ishlash, ba'zan bir
+        # necha soniya) ushlab turardi, shu paytda server boshqa hech
+        # qanday so'rovni (hatto /health'ni ham) qabul qila olmasdi.
+        resp = await asyncio.to_thread(
+            requests.post,
             "https://api.openai.com/v1/audio/transcriptions",
             headers={"Authorization": f"Bearer {OPENAI_API_KEY}"},
             files=files,
