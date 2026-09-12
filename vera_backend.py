@@ -150,7 +150,7 @@ DB_PATH = os.environ.get("VERA_DB", "vera.db")
 HOST = "0.0.0.0"
 # Railway PORT muhit o'zgaruvchisini avtomatik beradi; mahalliyda VERA_PORT
 # yoki standart 8000 ishlatiladi.
-PORT = int(os.environ.get("PORT", os.environ.get("VERA_PORT", "8000")))
+PORT = int(os.environ.get("PORT", os.environ.get("VERA_PORT", "8080")))
 
 # Railway PostgreSQL qo'shsangiz, DATABASE_URL avtomatik beriladi.
 # Bo'lmasa, mahalliy SQLite fayliga yoziladi (sinov uchun qulay).
@@ -301,6 +301,27 @@ def get_recent_history(limit: int = 16) -> List[dict]:
     return [{"role": r[0], "content": r[1]} for r in rows]
 
 
+def get_chat_history_for_display(limit: int = 200, channel: str = "app") -> List[dict]:
+    """Chat ekranida ko'rsatish uchun to'liq tarixni qaytaradi (rol, matn,
+    vaqt). Faqat 'app' kanalidagi xabarlar olinadi (ilova va ovozli suhbat
+    ham shu kanalga yozadi) — Telegram xabarlari aralashib ketmasligi
+    uchun. Barcha qurilmalar bitta backendga ulangani sababli, bu yerda
+    qaytadigan tarix barcha qurilmalarda bir xil bo'ladi."""
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            f"SELECT role, content, ts FROM messages WHERE channel = {PARAM} "
+            f"ORDER BY id DESC LIMIT {PARAM}",
+            (channel, limit),
+        )
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+    rows = list(reversed(rows))
+    return [{"role": r[0], "content": r[1], "ts": r[2]} for r in rows]
+
+
 # ------------------------------------------------------------------
 # 3) ESLATMALAR (tool orqali boshqariladi)
 # ------------------------------------------------------------------
@@ -408,7 +429,7 @@ def run_pc_command_and_wait(action: str, params: dict, agent_name: str = None) -
         if row and row[0] in ("done", "error"):
             status, result = row
             prefix = "Bajarildi" if status == "done" else "Xatolik"
-            return f"{prefix}: {result or '(natija yo\u2019q)'}"
+            return f"{prefix}: {result or '(natija yoq)'}"
         time.sleep(0.7)
     return (
         "Kompyuter javob bermadi (timeout). Windows agent dasturi (windows_agent.py) "
@@ -1666,6 +1687,15 @@ class NotificationReadRequest(BaseModel):
 @app.get("/health")
 def health():
     return {"status": "ok", "time": datetime.datetime.now().isoformat()}
+
+
+@app.get("/chat_history")
+def chat_history(limit: int = 200):
+    """Ilova ochilganda (yoki boshqa qurilmadan kirilganda) oldingi
+    yozishmalarni ko'rsatish uchun. Barcha xabarlar bitta umumiy bazada
+    saqlangani sababli, qaysi qurilmadan so'ralsa ham bir xil (yagona)
+    suhbat tarixi qaytadi."""
+    return {"messages": get_chat_history_for_display(limit=limit)}
 
 
 @app.post("/chat")
