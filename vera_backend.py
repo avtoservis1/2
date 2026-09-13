@@ -261,6 +261,16 @@ def init_db():
                     updated_at TEXT NOT NULL
                 )"""
             )
+            # app_state — oddiy kalit-qiymat holat jadvali. Hozircha faqat
+            # "joriy loyiha" (current_project) saqlash uchun ishlatiladi —
+            # Vera qaysi loyiha ustida ishlayotganingizni bilib, xotira
+            # qidiruvini o'sha loyihaga moslab boradi.
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS app_state(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )"""
+            )
         else:
             cur.execute(
                 """CREATE TABLE IF NOT EXISTS messages(
@@ -324,6 +334,12 @@ def init_db():
                     embedding TEXT,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                )"""
+            )
+            cur.execute(
+                """CREATE TABLE IF NOT EXISTS app_state(
+                    key TEXT PRIMARY KEY,
+                    value TEXT
                 )"""
             )
         conn.commit()
@@ -477,12 +493,13 @@ def get_pc_command_status(command_id: int):
     return row  # (status, result) yoki None
 
 
-def run_pc_command_and_wait(action: str, params: dict, agent_name: str = None) -> str:
+def run_pc_command_and_wait(action: str, params: dict, agent_name: str = None, timeout_sec: int = None) -> str:
     """Buyruqni navbatga qo'yadi va Windows agent bajarib, natija qaytargunicha
-    (yoki PC_COMMAND_TIMEOUT_SEC soniya o'tguncha) kutadi. Claude tool sifatida
-    chaqirganda ishlatiladi, shuning uchun natija darhol suhbatga qaytadi."""
+    (yoki timeout_sec — berilmasa PC_COMMAND_TIMEOUT_SEC — soniya o'tguncha)
+    kutadi. Claude tool sifatida chaqirganda ishlatiladi, shuning uchun
+    natija darhol suhbatga qaytadi."""
     command_id = enqueue_pc_command(action, params, agent_name)
-    deadline = time.time() + PC_COMMAND_TIMEOUT_SEC
+    deadline = time.time() + (timeout_sec or PC_COMMAND_TIMEOUT_SEC)
     while time.time() < deadline:
         row = get_pc_command_status(command_id)
         if row and row[0] in ("done", "error"):
@@ -928,6 +945,19 @@ TOOLS_SCHEMA = [
         },
     },
     {
+        "name": "pc_view_screen",
+        "description": (
+            "Windows kompyuterning joriy ekranidan skrinshot oladi va Claude vision "
+            "orqali tahlil qiladi: ekranda nima ko'rsatilganini tasvirlaydi VA agar "
+            "bosish/yozish mumkin bo'lgan tugma/maydon/havolalar bo'lsa, ularning "
+            "HAQIQIY EKRAN piksellaridagi (x, y) koordinatalarini ham qaytaradi — "
+            "shu koordinatalarni keyin pc_mouse_click'ga bevosita berish mumkin. "
+            "Har bir bosish/yozishdan oldin, va har bir qadamdan keyin (natijani "
+            "tekshirish uchun) qayta chaqiring."
+        ),
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
         "name": "pc_scan_computer",
         "description": (
             "Windows kompyuterdagi loyiha papkalarini (Flutter, Python, Node.js va h.k.) "
@@ -1025,6 +1055,25 @@ TOOLS_SCHEMA = [
                 "project": {"type": "string", "description": "Tegishli loyiha nomi (ixtiyoriy)."},
             },
             "required": ["content"],
+        },
+    },
+    {
+        "name": "memory_set_project",
+        "description": (
+            "Foydalanuvchi qaysi loyiha ustida ishlayotganini bildirganda "
+            "('hozir auto-marketplace loyihasida ishlayapman', 'endi boshqa "
+            "loyihaga o'tdim' va h.k.) chaqiriladi. Shundan keyin xotira "
+            "qidiruvi shu loyihaga moslab olib boriladi."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "project": {
+                    "type": "string",
+                    "description": "Loyiha nomi. Bo'sh qoldirilsa, joriy loyiha tozalanadi.",
+                },
+            },
+            "required": ["project"],
         },
     },
     {
@@ -1136,6 +1185,8 @@ def run_tool(name: str, tool_input: dict) -> str:
             )
         except RuntimeError as e:
             return str(e)
+    if name == "pc_view_screen":
+        return tool_pc_view_screen()
     if name == "pc_scan_computer":
         return tool_pc_scan_computer()
     if name == "memory_remember":
@@ -1144,6 +1195,8 @@ def run_tool(name: str, tool_input: dict) -> str:
             tool_input.get("category", "boshqa"),
             tool_input.get("project", ""),
         )
+    if name == "memory_set_project":
+        return tool_memory_set_project(tool_input.get("project", ""))
     if name == "memory_search":
         return tool_memory_search(tool_input.get("query", ""), tool_input.get("project", ""))
     return f"Noma'lum tool: {name}"
@@ -1451,31 +1504,111 @@ def tool_memory_search(query: str, project: str = "") -> str:
     return "\n".join(f"- ({r['category']}) {r['content']}" for r in results)
 
 
+def get_current_project() -> str:
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(f"SELECT value FROM app_state WHERE key = {PARAM}", ("current_project",))
+        row = cur.fetchone()
+        cur.close()
+        conn.close()
+    return row[0] if row else ""
+
+
+def set_current_project(project: str) -> None:
+    project = (project or "").strip()
+    now_key = "current_project"
+    with _db_lock:
+        conn = get_conn()
+        cur = conn.cursor()
+        if USE_POSTGRES:
+            cur.execute(
+                "INSERT INTO app_state(key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (now_key, project),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO app_state(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (now_key, project),
+            )
+        conn.commit()
+        cur.close()
+        conn.close()
+
+
+def tool_memory_set_project(project: str) -> str:
+    """Claude tool: foydalanuvchi 'hozir X loyihasida ishlayapman' yoki shunga
+    o'xshash gap aytganda chaqiriladi. Shundan keyingi barcha xabarlarda
+    xotira qidiruvi shu loyihaga moslab (bilan birga umumiy faktlar ham)
+    olib boriladi — loyihalar bir-biriga aralashib ketmasligi uchun."""
+    project = (project or "").strip()
+    if not project:
+        set_current_project("")
+        return "Joriy loyiha tozalandi — endi barcha loyihalar bo'yicha umumiy qidiraman."
+    set_current_project(project)
+    return f"Xo'p, endi \"{project}\" loyihasi ustida ishlayotganingizni hisobga olib boraman."
+
+
 # ------------------------------------------------------------------
 # 4) CLAUDE API BILAN GAPLASHISH
 # ------------------------------------------------------------------
 
 CLAUDE_API_URL = "https://api.anthropic.com/v1/messages"
+# Bir xabar ichida Claude necha marta ketma-ket tool chaqira olishi mumkin.
+# Oddiy savol-javob uchun 2-3 tasi yetarli, lekin "shu emailga kir",
+# "ilovani Play Consolega joyla" kabi ko'p bosqichli vazifalar uchun
+# (ekranga qarash -> bosish -> yana qarash -> yozish -> ...) ancha ko'proq
+# aylana kerak bo'ladi.
+MAX_TOOL_ROUNDS = int(os.environ.get("MAX_TOOL_ROUNDS", "25"))
 
 
 def build_system_prompt(user_text: str = "") -> str:
     now = datetime.datetime.now().isoformat(timespec="seconds")
 
+    current_project = ""
+    try:
+        current_project = get_current_project()
+    except Exception as e:
+        print(f"[MIYYA] joriy loyihani o'qishda xato: {e}")
+
     memory_section = ""
     if user_text.strip():
         try:
-            facts = search_memory(user_text, top_k=5, min_score=0.25)
+            facts = []
+            seen_ids = set()
+            if current_project:
+                for f in search_memory(user_text, project=current_project, top_k=4, min_score=0.2):
+                    facts.append(f)
+                    seen_ids.add(f["id"])
+            for f in search_memory(user_text, top_k=4, min_score=0.25):
+                if f["id"] not in seen_ids:
+                    facts.append(f)
+                    seen_ids.add(f["id"])
         except Exception as e:
             print(f"[MIYYA] system promptga qidirishda xato: {e}")
             facts = []
         if facts:
-            facts_text = "\n".join(f"- ({f['category']}) {f['content']}" for f in facts)
+            facts_text = "\n".join(
+                f"- ({f['category']}{', loyiha: ' + f['project'] if f.get('project') else ''}) {f['content']}"
+                for f in facts
+            )
             memory_section = (
                 "\n\nMIYYANGDA foydalanuvchi haqida quyidagi tegishli faktlar bor "
                 "(bular avval kompyuterdan yig'ilgan yoki suhbatda aytilgan — "
                 "javob berishda hisobga ol, lekin so'zma-so'z o'qib bermay, "
                 "tabiiy ravishda foydalan):\n" + facts_text
             )
+
+    project_section = ""
+    if current_project:
+        project_section = (
+            f"\n\nFoydalanuvchi HOZIR \"{current_project}\" loyihasi ustida ishlayapti deb "
+            "bilib turibsan (buni oxirgi marta o'zi aytgan). Shu loyihaga tegishli "
+            "savollarga shu kontekstda javob ber. Agar u boshqa loyihaga o'tganini "
+            "aytsa yoki 'boshqa loyiha' desa, memory_set_project tool'i bilan yangilab qo'y."
+        )
 
     return (
         "Sen Vera ismli, foydalanuvchiga shaxsan xizmat qiladigan, ayol ovozida gapiradigan "
@@ -1509,8 +1642,33 @@ def build_system_prompt(user_text: str = "") -> str:
         "muhim qaror yoki afzallik) biror narsani aytsa — memory_remember tool'idan "
         "foydalanib darhol xotiraga yoz. Agar foydalanuvchi o'zi yoki loyihalari "
         "haqida ('men haqimda nima bilasan', 'qaysi loyihalarim bor') so'rasa — "
-        "memory_search tool'idan foydalan. Agar foydalanuvchi kompyuterini "
-        "skanerlashni/o'rganishni so'rasa — pc_scan_computer tool'idan foydalan."
+        "memory_search tool'idan foydalan. Agar foydalanuvchi qaysi loyiha "
+        "ustida ishlashni boshlaganini yoki boshqa loyihaga o'tganini aytsa "
+        "— memory_set_project tool'idan foydalan (bu keyingi javoblaringizni "
+        "shu loyihaga moslab beradi). Agar foydalanuvchi kompyuterini "
+        "skanerlashni/o'rganishni so'rasa — pc_scan_computer tool'idan foydalan. "
+        "Agar foydalanuvchi ekranida nima borligini so'rasa yoki xatoni ekrandan "
+        "ko'rsatishni so'rasa — pc_view_screen tool'idan foydalan.\n\n"
+        "KO'P BOSQICHLI KOMPYUTER VAZIFALARI (masalan: 'shu emailga kir', "
+        "'ilovani Google Play Consolega joyla', biror saytda forma to'ldirish):\n"
+        "Bularni bajarish uchun pc_view_screen (ekranni ko'rish, u sizga "
+        "tugma/maydonlarning HAQIQIY EKRAN koordinatalarini beradi), "
+        "pc_mouse_click (bosish), pc_type_text (yozish), pc_key_press "
+        "(Tab, Enter va h.k.), pc_mouse_scroll tool'larini KETMA-KET, bir "
+        "necha marta chaqirib, vazifani bosqichma-bosqich bajar. Har bir "
+        "bosishdan OLDIN pc_view_screen bilan joriy holatni tekshir — "
+        "eski/eskirgan koordinataga ko'r-ko'rona bosma. QOIDALAR:\n"
+        "1) Parol yoki boshqa maxfiy ma'lumotni FAQAT foydalanuvchi shu "
+        "suhbatda o'zi aniq aytgan bo'lsa yoz — hech qachon taxmin qilma "
+        "yoki eslab qolgan (xotiradagi) parolni ishlatma.\n"
+        "2) QAYTARIB BO'LMAYDIGAN yoki OQIBATI KATTA amaldan oldin "
+        "(masalan 'Nashr qilish/Publish', 'Yuborish/Submit', to'lov qilish, "
+        "hisobni yoki faylni o'chirish, xabar jo'natish) — TO'XTA va "
+        "foydalanuvchidan ANIQ tasdiq so'ra, o'zing bosaverma.\n"
+        "3) Agar bir necha urinishdan keyin ham kerakli tugma/maydonni "
+        "topa olmasang yoki vaziyat noaniq bo'lsa, taxmin bilan davom "
+        "etaverish o'rniga foydalanuvchidan so'ra."
+        + project_section
         + memory_section
     )
 
@@ -1531,7 +1689,7 @@ def call_claude(messages: List[dict], user_text: str = "") -> str:
     conversation = list(messages)
     system_prompt = build_system_prompt(user_text)
 
-    for _ in range(5):  # tool-chaqiruv aylanalari uchun limit
+    for _ in range(MAX_TOOL_ROUNDS):  # tool-chaqiruv aylanalari uchun limit
         payload = {
             "model": CLAUDE_MODEL,
             "max_tokens": 1024,
@@ -1602,7 +1760,7 @@ def call_claude_stream(messages: List[dict], user_text: str = ""):
     conversation = list(messages)
     system_prompt = build_system_prompt(user_text)
 
-    for _ in range(5):  # tool-chaqiruv aylanalari uchun limit
+    for _ in range(MAX_TOOL_ROUNDS):  # tool-chaqiruv aylanalari uchun limit
         payload = {
             "model": CLAUDE_MODEL,
             "max_tokens": 1024,
@@ -1753,6 +1911,62 @@ def call_claude_stream(messages: List[dict], user_text: str = ""):
         return  # yakuniy matnli javob tugadi
 
     yield "Kechirasiz, so'rovni bajarishda muammo yuzaga keldi (tool aylana limiti)."
+
+
+def describe_image(image_b64: str, media_type: str, prompt: str) -> str:
+    """Bitta rasmni (skrinshot) Claude'ning vision imkoniyati orqali BITTA
+    so'rovda tasvirlaydi — suhbat tarixisiz, tool'siz, faqat tavsif matnini
+    qaytaradi. pc_view_screen tool'i va skrinshotni kuzatish (screen_watch)
+    fon jarayoni shundan foydalanadi."""
+    if not ANTHROPIC_API_KEY or "BU_YERGA" in ANTHROPIC_API_KEY:
+        return "Claude API kaliti sozlanmagan."
+    try:
+        resp = requests.post(
+            CLAUDE_API_URL,
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": CLAUDE_MODEL,
+                "max_tokens": 500,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            },
+            timeout=30,
+        )
+        resp.raise_for_status()
+        return "".join(
+            b.get("text", "") for b in resp.json().get("content", []) if b.get("type") == "text"
+        ).strip() or "Rasmni tavsiflab bo'lmadi."
+    except Exception as e:
+        return f"Ekranni tahlil qilishda xato: {e}"
+
+
+def tool_pc_view_screen() -> str:
+    """Claude tool: Windows agent'dan joriy skrinshotni so'rab, uni Claude
+    vision orqali tasvirlab, natijani darhol suhbatga qaytaradi."""
+    return run_pc_command_and_wait("take_screenshot", {}, timeout_sec=45)
+
+
+class VisionDescribeRequest(BaseModel):
+    image_base64: str
+    media_type: str = "image/jpeg"
+    prompt: str = (
+        "Bu foydalanuvchi kompyuterining skrinshoti. Ekranda qaysi dastur/oyna "
+        "ochiqligini, foydalanuvchi nima bilan shug'ullanayotganini (masalan "
+        "qaysi loyihada, qaysi faylda) va agar xato/ogohlantirish ko'rinsa "
+        "shuni QISQA (2-4 gap) tasvirlab ber. Shaxsiy/nozik ma'lumot "
+        "(parol, kartochka raqami va h.k.) ko'rinsa, uni AYTMA."
+    )
+    log_memory: bool = False
+    source: str = "on_demand"
 
 
 def process_user_message(user_text: str, channel: str) -> str:
@@ -2227,6 +2441,21 @@ def memory_list_endpoint(project: str = "", limit: int = 200):
     return {"facts": list_memory_facts(project=project, limit=limit)}
 
 
+@app.get("/memory/current_project")
+def memory_current_project_get():
+    return {"project": get_current_project()}
+
+
+class SetProjectRequest(BaseModel):
+    project: str = ""
+
+
+@app.post("/memory/current_project")
+def memory_current_project_set(req: SetProjectRequest):
+    set_current_project(req.project)
+    return {"status": "ok", "project": req.project}
+
+
 @app.delete("/memory/{fact_id}")
 def memory_delete_endpoint(fact_id: int):
     """Foydalanuvchi 'Miyya' ekranidan bitta faktni o'chirishi uchun."""
@@ -2234,6 +2463,20 @@ def memory_delete_endpoint(fact_id: int):
     if not deleted:
         raise HTTPException(status_code=404, detail="Fakt topilmadi.")
     return {"status": "ok"}
+
+
+@app.post("/vision/describe")
+def vision_describe(req: VisionDescribeRequest, token: str):
+    """Windows agent skrinshotni shu yerga yuboradi, biz Claude vision bilan
+    tasvirlab qaytaramiz. log_memory=true bo'lsa (masalan avtomatik
+    kuzatuvdan kelganda), tavsif epizodik xotiraga ham yoziladi."""
+    _check_agent_token(token)
+    if not req.image_base64.strip():
+        raise HTTPException(status_code=400, detail="image_base64 bo'sh bo'lishi mumkin emas.")
+    description = describe_image(req.image_base64, req.media_type, req.prompt)
+    if req.log_memory:
+        save_memory_event("screen_watch", description, source=req.source)
+    return {"description": description}
 
 
 @app.post("/chat_stream")
@@ -2578,10 +2821,11 @@ def pc_quick_action(req: PcQuickActionRequest):
     yozilmaydi, faqat pc_commands jadvaliga tushadi."""
     if req.action not in {
         "open_app", "close_app", "run_shell_command", "open_url",
-        "system_power", "get_system_status", "list_dir",
+        "system_power", "get_system_status", "list_dir", "take_screenshot",
     }:
         raise HTTPException(status_code=400, detail=f"Noma'lum amal: {req.action}")
-    result = run_pc_command_and_wait(req.action, req.params)
+    timeout = 45 if req.action == "take_screenshot" else None
+    result = run_pc_command_and_wait(req.action, req.params, timeout_sec=timeout)
     return {"result": result}
 
 
